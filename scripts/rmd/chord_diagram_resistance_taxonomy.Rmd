@@ -1,0 +1,1938 @@
+---
+title: "Antimicrobial Resistance Gene and Taxonomy Associations"
+subtitle: "Poultry Processing Plant: AMR Read-Level Analysis"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 12
+)
+
+# ── Output directory for saved plots ─────────────────────────────────────────
+plot_dir <- "/Volumes/Alice/2_POULTRY_PROCESSING/Analysis/chord_plots_read"
+dir.create(plot_dir, showWarnings = FALSE)
+
+# Helper: save a circlize/base-R plot to PNG and PDF
+save_chord <- function(filename, plot_fn, width = 14, height = 14, dpi = 300) {
+  png(file.path(plot_dir, paste0(filename, ".png")),
+      width = width, height = height, units = "in", res = dpi)
+  plot_fn()
+  dev.off()
+
+  png(file.path(plot_dir, paste0(filename, "_nobg.png")),
+      width = width, height = height, units = "in", res = dpi,
+      bg = "transparent")
+  plot_fn()
+  dev.off()
+
+  pdf(file.path(plot_dir, paste0(filename, ".pdf")),
+      width = width, height = height)
+  plot_fn()
+  dev.off()
+}
+```
+
+## Overview
+
+Each row in the source TSV files is a single nanopore read with:
+- a Kraken2 taxonomic classification, and
+- an ABRicate resistance gene hit (across 7 databases: resfinder, card, ncbi,
+  megares, ecoli_vf, vfdb, plasmidfinder).
+
+The chord diagram connects **resistance gene classes** (left arc) to
+**bacterial genera** (right arc). Chord width = number of reads carrying that
+gene-class/genus combination. Genes are coloured by antibiotic class; genera
+are coloured by phylum.
+
+**Sample key:**
+
+| Treatment | Description |
+|---|---|
+| EVI_RVS | Post-evisceration, RVS broth enrichment |
+| EVI_CAT | Post-evisceration, BF Bolton + CAT enrichment |
+| ASC_RVS | Post-acidified sodium chlorite (ASC) wash, RVS broth enrichment |
+| ASC_CAT | Post-acidified sodium chlorite (ASC) wash, BF Bolton + CAT enrichment |
+
+---
+
+## 1. Setup
+
+```{r packages}
+library(tidyverse)
+library(circlize)
+library(RColorBrewer)
+library(viridis)
+library(knitr)
+library(kableExtra)
+library(pheatmap)
+library(reshape2)
+library(ggrepel)
+```
+
+---
+
+## 2. Load and Combine Data
+
+```{r load-data}
+# ── Path to the folder containing per-treatment sub-directories ──────────────
+data_dir <- "/Volumes/Alice/2_POULTRY_PROCESSING/Analysis/Read_level_kraken-to-abricate_associations"
+
+# Auto-detect all TSV files recursively
+tsv_files <- list.files(data_dir, pattern = "\\.tsv$",
+                         full.names = TRUE, recursive = TRUE)
+
+cat("Found", length(tsv_files), "TSV files:\n")
+cat(paste(" ", basename(tsv_files)), sep = "\n")
+
+# Extract treatment and sample ID from file name
+# Expected pattern: CH01_ASC_CAT_all_databases_with_taxonomy.tsv
+parse_filename <- function(path) {
+  base <- basename(path)
+  # Extract sample (e.g. CH01) and treatment (e.g. ASC_CAT)
+  sample_id  <- str_extract(base, "^[A-Z]+[0-9]+")
+  treatment  <- str_extract(base, "(?<=_)[A-Z]+_[A-Z]+(?=_all)")
+  data.frame(file = path, sample_id = sample_id, treatment = treatment,
+             stringsAsFactors = FALSE)
+}
+
+file_meta <- map_dfr(tsv_files, parse_filename)
+
+raw <- map2_dfr(
+  file_meta$file, seq_len(nrow(file_meta)),
+  function(path, i) {
+    df <- read_tsv(path, col_types = cols(.default = "c"),
+                   show_col_types = FALSE)
+    df$sample_id  <- file_meta$sample_id[i]
+    df$treatment  <- file_meta$treatment[i]
+    df
+  }
+) %>%
+  mutate(
+    `%COVERAGE` = as.numeric(`%COVERAGE`),
+    `%IDENTITY` = as.numeric(`%IDENTITY`)
+  )
+
+cat("\nTotal rows loaded:", nrow(raw), "\n")
+cat("Treatments found:", paste(unique(raw$treatment), collapse = ", "), "\n")
+```
+
+---
+
+## 3. Filter to NCBI
+
+**NCBI AMRFinderPlus** is used as the single source database for resistance gene
+annotations. NCBI gene names are already in standard literature nomenclature
+(e.g. `tet(A)`, `erm(B)`, `blaCTX-M-1`) and the RESISTANCE column is consistently
+populated, making no further name mapping or class inference necessary.
+
+Each read is used as-is - one row per read. Allele-version suffixes (e.g. `-1`, `-15`)
+are retained as they carry biologically meaningful allele information.
+
+```{r dedup}
+primary_db <- "ncbi"
+
+cat("Databases present in raw data:", paste(sort(unique(raw$DATABASE)), collapse = ", "), "\n")
+
+dedup <- raw %>%
+  filter(DATABASE == primary_db) %>%
+  filter(!is.na(GENE), GENE != "") %>%
+  mutate(
+    gene_norm  = str_trim(GENE),   # preserve original case - NCBI names are already conventional
+    res_source = coalesce(RESISTANCE, PRODUCT, "")
+  )
+
+cat("\nDatabase used:", primary_db, "\n")
+cat("Rows loaded:", nrow(dedup), "\n")
+cat("Unique genes:", n_distinct(dedup$gene_norm), "\n")
+cat("Unique reads with a hit:", n_distinct(dedup$READ_ID), "\n")
+```
+
+---
+
+## 4. Normalise Resistance Classes
+
+The RESISTANCE field has inconsistent naming across databases. Map all
+variants to standard antibiotic class names.
+
+```{r resistance-normalise}
+normalise_resistance <- function(res) {
+  res <- str_to_lower(res)
+  case_when(
+    # beta-lactam: "beta.lactam" matches hyphenated/spaced forms; "betalactam" (no separator)
+    # matches MEGARes PRODUCT hierarchy (e.g. "Drugs:betalactams:Class_A_betalactamases:CTX")
+    str_detect(res, "beta.?lactam|betalactam|cephalosporin|penam|carbapenem|penicillin|monobactam|cephamycin|blaec|blac|blad|ctxm|shv|tem:|oxacillin") ~ "beta-lactam",
+    str_detect(res, "tetracycline|doxycycline|minocycline|tigecycline")                                ~ "tetracycline",
+    str_detect(res, "aminoglycoside|amikacin|gentamicin|kanamycin|streptomycin|tobramycin")            ~ "aminoglycoside",
+    str_detect(res, "fluoroquinolone|quinolone|ciprofloxacin|nalidixic")                               ~ "quinolone",
+    # MLS = Macrolide-Lincosamide-Streptogramin (MEGARes uses "MLS" as a combined category)
+    str_detect(res, "macrolide|erythromycin|azithromycin|clarithromycin|mls:|:mls")                   ~ "macrolide",
+    str_detect(res, "phenicol|chloramphenicol")                                                        ~ "phenicol",
+    str_detect(res, "lincosamide|lincomycin|clindamycin")                                              ~ "lincosamide",
+    str_detect(res, "streptogramin|dalfopristin|virginiamycin|pristinamycin")                          ~ "streptogramin",
+    str_detect(res, "sulfonamide|sulphonamide|sulph|sulf")                                             ~ "sulphonamide",
+    str_detect(res, "trimethoprim")                                                                    ~ "trimethoprim",
+    str_detect(res, "glycopeptide|vancomycin|teicoplanin")                                             ~ "glycopeptide",
+    str_detect(res, "oxazolidinone|linezolid")                                                         ~ "oxazolidinone",
+    str_detect(res, "pleuromutilin|tiamulin")                                                          ~ "pleuromutilin",
+    str_detect(res, "rifamycin|rifampicin")                                                            ~ "rifamycin",
+    str_detect(res, "fosfomycin")                                                                      ~ "fosfomycin",
+    str_detect(res, "fusidic")                                                                         ~ "fusidic acid",
+    str_detect(res, "disinfectant|biocide|qac|quaternary")                                            ~ "disinfectant/biocide",
+    # Cationic antimicrobial peptides (colistin/polymyxin resistance via lipid A modification)
+    # MEGARes PRODUCT: "Drugs:Cationic_antimicrobial_peptides:Lipid_A_modification:PMRF/EPTA/UGD"
+    str_detect(res, "cationic|polymyxin|colistin|lipid_a|pmrf|epta|arnb|peta")                       ~ "peptide antibiotic",
+    # Bacitracin resistance (undecaprenyl pyrophosphate phosphatase genes - BacA)
+    str_detect(res, "bacitracin|baca|undecaprenyl")                                                   ~ "bacitracin",
+    str_detect(res, "streptothricin|sat:")                                                             ~ "streptothricin",
+    str_detect(res, "multi|efflux")                                                                    ~ "multidrug efflux",
+    TRUE ~ "other"
+  )
+}
+
+dedup <- dedup %>%
+  # MEGARes does not populate the RESISTANCE column in ABRicate output.
+  # res_source was set in Section 3 to PRODUCT (the resistance description field)
+  # when RESISTANCE is blank, so normalise_resistance works correctly either way.
+  mutate(res_class = normalise_resistance(res_source))
+
+cat("Resistance class distribution:\n")
+print(sort(table(dedup$res_class), decreasing = TRUE))
+```
+
+---
+
+## 5. Clean Taxonomy and Assign Genus + Phylum
+
+Reads are annotated at three taxonomic levels:
+
+- **Family** - broadest resolution; all genus/species reads are mapped up to family
+- **Genus** - first word of the Kraken2 taxonomy string
+- **Species** - reads with a two-word taxonomy (genus + species epithet)
+
+Reads classified only to root, phylum, class, order, or family level by Kraken2
+cannot be resolved to genus and are grouped as **"Unclassified"** in each chord diagram.
+
+```{r taxonomy-clean}
+# ── Genus → Phylum lookup ─────────────────────────────────────────────────────
+phylum_lookup <- c(
+  "Campylobacter"          = "Campylobacterota",
+  "Arcobacter"             = "Campylobacterota",
+  "Helicobacter"           = "Campylobacterota",
+  "Escherichia"            = "Proteobacteria",
+  "Salmonella"             = "Proteobacteria",
+  "Comamonas"              = "Proteobacteria",
+  "Pseudomonas"            = "Proteobacteria",
+  "Acinetobacter"          = "Proteobacteria",
+  "Klebsiella"             = "Proteobacteria",
+  "Enterobacter"           = "Proteobacteria",
+  "Citrobacter"            = "Proteobacteria",
+  "Hafnia"                 = "Proteobacteria",
+  "Serratia"               = "Proteobacteria",
+  "Morganella"             = "Proteobacteria",
+  "Vibrio"                 = "Proteobacteria",
+  "Candidatus"             = "Proteobacteria",
+  "Lactobacillus"          = "Firmicutes",
+  "Lactococcus"            = "Firmicutes",
+  "Megamonas"              = "Firmicutes",
+  "Enterococcus"           = "Firmicutes",
+  "Staphylococcus"         = "Firmicutes",
+  "Listeria"               = "Firmicutes",
+  "Clostridium"            = "Firmicutes",
+  "Ruminococcus"           = "Firmicutes",
+  "Faecalibacterium"       = "Firmicutes",
+  "Blautia"                = "Firmicutes",
+  "Erysipelatoclostridium" = "Firmicutes",
+  "Streptococcus"          = "Firmicutes",
+  "Bacillus"               = "Firmicutes",
+  "Ligilactobacillus"      = "Firmicutes",
+  "Limosilactobacillus"    = "Firmicutes",
+  "Bacteroides"            = "Bacteroidota",
+  "Prevotella"             = "Bacteroidota",
+  "Parabacteroides"        = "Bacteroidota",
+  "Alistipes"              = "Bacteroidota",
+  "Bifidobacterium"        = "Actinomycetota",
+  "Corynebacterium"        = "Actinomycetota",
+  "Propionibacterium"      = "Actinomycetota",
+  "Cutibacterium"          = "Actinomycetota"
+)
+
+# ── Genus → Family lookup ─────────────────────────────────────────────────────
+family_lookup <- c(
+  "Campylobacter"          = "Campylobacteraceae",
+  "Arcobacter"             = "Arcobacteraceae",
+  "Helicobacter"           = "Helicobacteraceae",
+  "Escherichia"            = "Enterobacteriaceae",
+  "Salmonella"             = "Enterobacteriaceae",
+  "Klebsiella"             = "Enterobacteriaceae",
+  "Enterobacter"           = "Enterobacteriaceae",
+  "Citrobacter"            = "Enterobacteriaceae",
+  "Hafnia"                 = "Enterobacteriaceae",
+  "Serratia"               = "Enterobacteriaceae",
+  "Morganella"             = "Enterobacteriaceae",
+  "Comamonas"              = "Comamonadaceae",
+  "Pseudomonas"            = "Pseudomonadaceae",
+  "Acinetobacter"          = "Moraxellaceae",
+  "Vibrio"                 = "Vibrionaceae",
+  "Candidatus"             = "Unclassified",
+  "Lactobacillus"          = "Lactobacillaceae",
+  "Ligilactobacillus"      = "Lactobacillaceae",
+  "Limosilactobacillus"    = "Lactobacillaceae",
+  "Lactococcus"            = "Streptococcaceae",
+  "Streptococcus"          = "Streptococcaceae",
+  "Enterococcus"           = "Enterococcaceae",
+  "Staphylococcus"         = "Staphylococcaceae",
+  "Listeria"               = "Listeriaceae",
+  "Bacillus"               = "Bacillaceae",
+  "Megamonas"              = "Veillonellaceae",
+  "Clostridium"            = "Clostridiaceae",
+  "Faecalibacterium"       = "Oscillospiraceae",
+  "Ruminococcus"           = "Oscillospiraceae",
+  "Blautia"                = "Lachnospiraceae",
+  "Erysipelatoclostridium" = "Erysipelotrichaceae",
+  "Bacteroides"            = "Bacteroidaceae",
+  "Prevotella"             = "Prevotellaceae",
+  "Parabacteroides"        = "Tannerellaceae",
+  "Alistipes"              = "Rikenellaceae",
+  "Bifidobacterium"        = "Bifidobacteriaceae",
+  "Corynebacterium"        = "Corynebacteriaceae",
+  "Propionibacterium"      = "Propionibacteriaceae",
+  "Cutibacterium"          = "Propionibacteriaceae"
+)
+
+# ── Reverse lookup: family name → phylum (for reads classified at family level)
+# Kraken2 can classify a read to any rank. A read labelled "Enterobacteriaceae"
+# (family level) has word(1) = "Enterobacteriaceae", which is not in phylum_lookup
+# (genus keys only). Without this reverse map, those reads fall through to
+# "Unclassified" even in the family chord - losing real signal.
+family_to_phylum <- family_lookup %>%
+  enframe(name = "genus_key", value = "family_name") %>%
+  mutate(phylum_val = phylum_lookup[genus_key]) %>%
+  distinct(family_name, phylum_val) %>%
+  { setNames(.$phylum_val, .$family_name) }
+
+known_families <- names(family_to_phylum)   # e.g. "Enterobacteriaceae", etc.
+
+# ── Assign all three levels ───────────────────────────────────────────────────
+# Rollup logic:
+#   Species read  ("Escherichia coli")   → genus = "Escherichia", family via lookup ✓
+#   Genus read    ("Escherichia")         → genus = "Escherichia", family via lookup ✓
+#   Family read   ("Enterobacteriaceae")  → genus = "Unclassified", family = name  ✓ (fixed)
+#   Higher / root                         → Unclassified at all levels              ✓
+taxonomy_clean <- dedup %>%
+  filter(!is.na(TAXONOMY), TAXONOMY != "") %>%
+  mutate(
+    tax1 = word(TAXONOMY, 1),   # candidate genus (or family/higher for coarse reads)
+
+    # Genus: recognised only when first word is a known genus
+    genus  = if_else(tax1 %in% names(phylum_lookup), tax1, "Unclassified"),
+    phylum = if_else(genus != "Unclassified", phylum_lookup[genus], "Unclassified"),
+
+    # Family: from resolved genus OR, when genus is unknown, from a direct family match
+    family = case_when(
+      genus != "Unclassified" ~ coalesce(family_lookup[genus], "Unclassified"),
+      tax1  %in% known_families ~ tax1,   # Kraken2 stopped at family level
+      TRUE                      ~ "Unclassified"
+    ),
+
+    # Phylum for family-only reads (needed to colour family sectors correctly)
+    phylum = case_when(
+      phylum != "Unclassified"  ~ phylum,
+      family %in% known_families ~ coalesce(family_to_phylum[family], "Unclassified"),
+      TRUE                       ~ "Unclassified"
+    ),
+
+    # Species: genus + epithet when the read has two words and genus is resolved
+    species = case_when(
+      genus == "Unclassified" ~ "Unclassified",
+      str_count(str_trim(TAXONOMY), "\\S+") >= 2 ~
+        paste(word(TAXONOMY, 1), word(TAXONOMY, 2)),
+      TRUE ~ "Unclassified"
+    )
+  ) %>%
+  select(-tax1)
+
+# ── Resolution summary across levels ─────────────────────────────────────────
+res_summary <- taxonomy_clean %>%
+  group_by(treatment) %>%
+  summarise(
+    total          = n(),
+    family_resolved  = sum(family  != "Unclassified"),
+    genus_resolved   = sum(genus   != "Unclassified"),
+    species_resolved = sum(species != "Unclassified"),
+    .groups = "drop"
+  ) %>%
+  mutate(across(ends_with("resolved"),
+                ~ paste0(.x, " (", round(100 * .x / total, 1), "%)"),
+                .names = "{.col}_pct")) %>%
+  select(Treatment = treatment,
+         `Family resolved`  = family_resolved_pct,
+         `Genus resolved`   = genus_resolved_pct,
+         `Species resolved` = species_resolved_pct)
+
+kable(res_summary, caption = "Read counts resolved at each taxonomic level")
+```
+
+---
+
+## 6. Build Count Matrices
+
+```{r build-matrices}
+# taxon_col: "family", "genus", or "species"
+# Resistance-class level (rows = res_class)
+build_mat <- function(df, taxon_col = "genus", min_reads = 3) {
+  mat <- df %>%
+    count(res_class, taxon = .data[[taxon_col]]) %>%
+    pivot_wider(names_from = taxon, values_from = n, values_fill = 0L) %>%
+    column_to_rownames("res_class") %>%
+    as.matrix()
+  mat <- mat[rowSums(mat) >= min_reads, colSums(mat) >= min_reads, drop = FALSE]
+  mat
+}
+
+# Gene level (rows = individual gene_norm names)
+# min_reads filters to genes with enough reads to be visible in the diagram
+build_mat_gene <- function(df, taxon_col = "genus", min_reads = 5, top_n = NULL) {
+  mat <- df %>%
+    count(gene_norm, taxon = .data[[taxon_col]]) %>%
+    pivot_wider(names_from = taxon, values_from = n, values_fill = 0L) %>%
+    column_to_rownames("gene_norm") %>%
+    as.matrix()
+  mat <- mat[rowSums(mat) >= min_reads, colSums(mat) >= min_reads, drop = FALSE]
+  # Optionally keep only the top N genes by total read count (keeps diagrams readable)
+  if (!is.null(top_n) && nrow(mat) > top_n) {
+    top_genes <- names(sort(rowSums(mat), decreasing = TRUE)[seq_len(top_n)])
+    mat <- mat[top_genes, , drop = FALSE]
+  }
+  mat
+}
+
+# Class-level matrices
+mat_family  <- build_mat(taxonomy_clean, "family")
+mat_genus   <- build_mat(taxonomy_clean, "genus")
+mat_species <- build_mat(taxonomy_clean, "species")
+
+# Gene-level matrices
+mat_gene_family  <- build_mat_gene(taxonomy_clean, "family")
+mat_gene_genus   <- build_mat_gene(taxonomy_clean, "genus")
+mat_gene_species <- build_mat_gene(taxonomy_clean, "species")
+
+cat("── Class-level matrices ──\n")
+cat("Family  matrix:", nrow(mat_family),  "×", ncol(mat_family),  "\n")
+cat("Genus   matrix:", nrow(mat_genus),   "×", ncol(mat_genus),   "\n")
+cat("Species matrix:", nrow(mat_species), "×", ncol(mat_species), "\n")
+cat("── Gene-level matrices ──\n")
+cat("Family  matrix:", nrow(mat_gene_family),  "×", ncol(mat_gene_family),  "\n")
+cat("Genus   matrix:", nrow(mat_gene_genus),   "×", ncol(mat_gene_genus),   "\n")
+cat("Species matrix:", nrow(mat_gene_species), "×", ncol(mat_gene_species), "\n")
+```
+
+---
+
+## 7. Colour Palettes
+
+```{r colours}
+# ── Resistance class colours ──────────────────────────────────────────────────
+res_class_colours <- c(
+  "beta-lactam"         = "#5B7FBF",
+  "tetracycline"        = "#3A9E4D",
+  "aminoglycoside"      = "#E8821A",
+  "quinolone"           = "#1F3A7A",
+  "macrolide"           = "#8DB4E2",
+  "phenicol"            = "#404040",
+  "lincosamide"         = "#E8A0C8",
+  "streptogramin"       = "#D46FA0",
+  "sulphonamide"        = "#5BC8D2",
+  "trimethoprim"        = "#1B6B2A",
+  "glycopeptide"        = "#6B3FA0",
+  "oxazolidinone"       = "#A07850",
+  "pleuromutilin"       = "#E0B040",
+  "rifamycin"           = "#B05030",
+  "fosfomycin"          = "#E060C0",
+  "fusidic acid"        = "#D08050",
+  "disinfectant/biocide"= "#505050",
+  "multidrug efflux"    = "#909090",
+  "peptide antibiotic"  = "#2E8B8B",
+  "bacitracin"          = "#8B6914",
+  "streptothricin"      = "#7A3F00",
+  "other"               = "#D0D0D0"
+)
+
+# ── Phylum colours (shared across all taxonomic levels) ──────────────────────
+phylum_colours <- c(
+  "Campylobacterota" = "#2E9E9E",
+  "Proteobacteria"   = "#E07820",
+  "Firmicutes"       = "#C83878",
+  "Bacteroidota"     = "#D4B840",
+  "Actinomycetota"   = "#7B4FCF",
+  "Unclassified"     = "#C8C8C8"
+)
+
+# ── Per-level taxon → phylum → colour lookups ─────────────────────────────────
+# Family
+family_phylum_tbl <- taxonomy_clean %>%
+  distinct(family, phylum) %>%
+  filter(family != "Unclassified") %>%
+  bind_rows(tibble(family = "Unclassified", phylum = "Unclassified"))
+
+family_colours  <- setNames(phylum_colours[family_phylum_tbl$phylum],
+                             family_phylum_tbl$family)
+family_phylum_v <- setNames(family_phylum_tbl$phylum, family_phylum_tbl$family)
+
+# Genus
+genus_phylum_tbl <- taxonomy_clean %>% distinct(genus, phylum)
+genus_colours    <- setNames(phylum_colours[genus_phylum_tbl$phylum],
+                              genus_phylum_tbl$genus)
+genus_phylum_v   <- setNames(genus_phylum_tbl$phylum, genus_phylum_tbl$genus)
+
+# Supplement with ALL genera from phylum_lookup so that feature-specific databases
+# (VFDB, PlasmidFinder, etc.) whose genera may not appear in the MEGARes data still
+# get correct phylum assignments in draw_chord's bottomright legend.
+missing_genera <- setdiff(names(phylum_lookup), names(genus_phylum_v))
+if (length(missing_genera) > 0) {
+  genus_phylum_v <- c(genus_phylum_v, phylum_lookup[missing_genera])
+  genus_colours  <- c(genus_colours,
+                      setNames(phylum_colours[phylum_lookup[missing_genera]],
+                               missing_genera))
+}
+
+# Species
+species_phylum_tbl <- taxonomy_clean %>%
+  distinct(species, phylum) %>%
+  filter(species != "Unclassified") %>%
+  bind_rows(tibble(species = "Unclassified", phylum = "Unclassified"))
+
+species_colours  <- setNames(phylum_colours[species_phylum_tbl$phylum],
+                              species_phylum_tbl$species)
+species_phylum_v <- setNames(species_phylum_tbl$phylum, species_phylum_tbl$species)
+
+# ── Gene → colour (genes are coloured by their resistance class) ──────────────
+gene_class_lut <- taxonomy_clean %>% distinct(gene_norm, res_class)
+gene_row_colours <- setNames(res_class_colours[gene_class_lut$res_class],
+                              gene_class_lut$gene_norm)
+gene_row_colours[is.na(gene_row_colours)] <- "#AAAAAA"
+
+# ── Sector colour builder (works for any level) ───────────────────────────────
+# row_colours: named colour vector for row sectors (res_class_colours or gene_row_colours)
+make_sector_colours <- function(mat, taxon_colours, row_colours = res_class_colours) {
+  rc <- row_colours[rownames(mat)]
+  tc <- taxon_colours[colnames(mat)]
+  rc[is.na(rc)] <- "#AAAAAA"
+  tc[is.na(tc)] <- "#C8C8C8"
+  c(rc, tc)
+}
+```
+
+---
+
+## 8. Chord Diagrams
+
+```{r draw-chord-function}
+# taxon_colours  : named vector of colours for each taxon sector
+# phylum_of_taxon: named vector mapping taxon name → phylum (for legend)
+# level_label    : string shown in the phylum legend title ("Family" / "Genus" / "Species")
+# row_colours    : named vector for row sectors; defaults to res_class_colours (class-level);
+#                  pass gene_row_colours for gene-level diagrams
+draw_chord <- function(mat, title = "",
+                        taxon_colours, phylum_of_taxon,
+                        level_label = "Taxon",
+                        row_colours = res_class_colours,
+                        link.sort = TRUE,
+                        scale_fn = sqrt,
+                        row_legend_cols  = NULL,   # named colour vector for custom legend
+                        row_legend_title = "Antibiotic resistance\ngene class",
+                        label_cex          = 1.1,   # sector label size
+                        legend_cex         = 1.1,   # legend text size
+                        label_track        = 30,    # label track height in mm
+                        label_y_frac       = 0.5,   # 0 = inner edge (close to circle), 0.5 = middle
+                        canvas_expand      = 1.0,   # expand canvas beyond default c(-1,1)
+                        show_phylum_legend = TRUE) {# set FALSE to hide phylum legend
+
+  # Drop any rows/columns whose name is NA or empty - these would cause
+  # "length of dimnames not equal to array extent" inside chordDiagram
+  mat <- mat[!is.na(rownames(mat)) & rownames(mat) != "", ,  drop = FALSE]
+  mat <- mat[ , !is.na(colnames(mat)) & colnames(mat) != "", drop = FALSE]
+  if (nrow(mat) < 2 || ncol(mat) < 2) {
+    message("draw_chord: fewer than 2 valid rows or columns after NA removal - skipping.")
+    return(invisible(NULL))
+  }
+
+  sector_col <- make_sector_colours(mat, taxon_colours, row_colours)
+
+  row_ord <- rownames(mat)[order(rowSums(mat), decreasing = TRUE)]
+  col_ord <- colnames(mat)[order(colSums(mat), decreasing = TRUE)]
+  mat_ord <- mat[row_ord, col_ord, drop = FALSE]
+
+  # Apply scale transformation to compress dynamic range so low-count chords
+  # remain visible. Defaults to sqrt(); pass scale_fn = NULL to use raw counts.
+  if (!is.null(scale_fn)) {
+    mat_plot <- scale_fn(mat_ord + 1) - scale_fn(1)  # shift so 0 stays 0
+  } else {
+    mat_plot <- mat_ord
+  }
+
+  circos.clear()
+  # Expand margins to give labels breathing room (scaled with canvas_expand)
+  mar_outer <- 2 + 3 * (canvas_expand - 1)
+  par(mar = c(mar_outer, mar_outer, mar_outer + 2, mar_outer))
+
+  # Adaptive gap: cap total gap space at ~120° so many-sector diagrams don't overflow.
+  # circos.par() must be called AFTER circos.clear() to take effect.
+  n_sectors <- nrow(mat_ord) + ncol(mat_ord)
+  gap_deg   <- max(0.3, min(2, 120 / n_sectors))
+  circos.par(
+    gap.after    = gap_deg,
+    canvas.xlim  = c(-canvas_expand, canvas_expand),
+    canvas.ylim  = c(-canvas_expand, canvas_expand)
+  )
+
+  chordDiagram(
+    mat_plot,
+    grid.col          = sector_col,
+    transparency      = 0.35,
+    link.sort         = link.sort,
+    link.decreasing   = TRUE,
+    annotationTrack   = NULL,
+    preAllocateTracks = list(
+      list(track.height = mm_h(label_track)),  # track 1 (outermost): labels
+      list(track.height = mm_h(7))             # track 2: coloured blocks
+    ),
+    directional = 0
+  )
+
+  # Track 2: coloured sector blocks
+  circos.trackPlotRegion(
+    track.index = 2,
+    panel.fun   = function(x, y) {
+      sec  <- get.cell.meta.data("sector.index")
+      xlim <- get.cell.meta.data("xlim")
+      ylim <- get.cell.meta.data("ylim")
+      circos.rect(xlim[1], ylim[1], xlim[2], ylim[2],
+                  col = sector_col[sec], border = "white")
+    },
+    bg.border = NA
+  )
+
+  # Track 1: labels outside coloured blocks
+  circos.trackPlotRegion(
+    track.index = 1,
+    panel.fun   = function(x, y) {
+      sec  <- get.cell.meta.data("sector.index")
+      xlim <- get.cell.meta.data("xlim")
+      ylim <- get.cell.meta.data("ylim")
+      y_pos <- ylim[1] + (ylim[2] - ylim[1]) * label_y_frac
+      circos.text(
+        x = mean(xlim), y = y_pos, labels = sec,
+        facing = "clockwise", niceFacing = TRUE,
+        cex = label_cex, col = "black", adj = c(0, 0.5)
+      )
+    },
+    bg.border = NA
+  )
+
+  title(title, cex.main = 1.2, line = 0.5)
+
+  # Legends
+  phyla_present <- unique(na.omit(phylum_of_taxon[colnames(mat_ord)]))
+
+  # Row legend: use supplied palette when provided; otherwise reverse-match
+  # colours back to res_class_colours (works for class- and gene-level AMR diagrams)
+  if (!is.null(row_legend_cols)) {
+    leg_cols  <- row_legend_cols
+    leg_names <- names(row_legend_cols)
+  } else {
+    row_cols_used <- unname(row_colours[rownames(mat_ord)])
+    row_cols_used <- row_cols_used[!is.na(row_cols_used)]
+    leg_names     <- names(res_class_colours)[res_class_colours %in% row_cols_used]
+    leg_cols      <- res_class_colours[leg_names]
+  }
+
+  legend("bottomleft",
+    legend = leg_names, fill = leg_cols,
+    title  = row_legend_title,
+    bty = "n", cex = legend_cex, x.intersp = 0.8)
+
+  if (show_phylum_legend && length(phyla_present) > 0) {
+    legend("bottomright",
+      legend = phyla_present, fill = phylum_colours[phyla_present],
+      title  = paste("Phylum\n(", level_label, "level)"),
+      bty = "n", cex = legend_cex, x.intersp = 0.8)
+  }
+}
+```
+
+### 8.1 Family Level - All Samples
+
+```{r chord-family-all, fig.width=14, fig.height=14}
+draw_chord(mat_family, "AMR Resistance Class by Family (All Samples)",
+           family_colours, family_phylum_v, "Family")
+
+save_chord("chord_class_family_all",
+           function() draw_chord(mat_family,
+             "AMR Resistance Class by Family (All Samples)",
+             family_colours, family_phylum_v, "Family"))
+```
+
+### 8.2 Genus Level - All Samples
+
+```{r chord-genus-all, fig.width=14, fig.height=14}
+draw_chord(mat_genus, "AMR Resistance Class by Genus (All Samples)",
+           genus_colours, genus_phylum_v, "Genus")
+
+save_chord("chord_class_genus_all",
+           function() draw_chord(mat_genus,
+             "AMR Resistance Class by Genus (All Samples)",
+             genus_colours, genus_phylum_v, "Genus"))
+```
+
+### 8.3 Species Level - All Samples
+
+```{r chord-species-all, fig.width=14, fig.height=14}
+if (ncol(mat_species) >= 2 && nrow(mat_species) >= 2) {
+  draw_chord(mat_species, "AMR Resistance Class by Species (All Samples)",
+             species_colours, species_phylum_v, "Species")
+
+  save_chord("chord_class_species_all",
+             function() draw_chord(mat_species,
+               "AMR Resistance Class by Species (All Samples)",
+               species_colours, species_phylum_v, "Species"))
+} else {
+  cat("Insufficient species-level data for combined chord diagram.\n")
+}
+```
+
+### 8.4 Per-treatment Chord Diagrams - Resistance Class Level
+
+```{r chord-per-treatment, fig.width=13, fig.height=13, results='asis'}
+treatments <- sort(unique(taxonomy_clean$treatment))
+
+for (trt in treatments) {
+  df_trt   <- taxonomy_clean %>% filter(treatment == trt)
+  trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+
+  for (lvl in c("family", "genus", "species")) {
+    tc <- switch(lvl,
+                 family  = family_colours,
+                 genus   = genus_colours,
+                 species = species_colours)
+    pv <- switch(lvl,
+                 family  = family_phylum_v,
+                 genus   = genus_phylum_v,
+                 species = species_phylum_v)
+
+    mat_trt <- build_mat(df_trt, taxon_col = lvl, min_reads = 2)
+
+    if (nrow(mat_trt) < 2 || ncol(mat_trt) < 2) next
+
+    heading <- paste0("\n#### ", trt, " - ", str_to_title(lvl), " level\n\n")
+    cat(heading)
+
+    ttl   <- paste0("AMR Resistance Class by ", str_to_title(lvl), ": ", trt)
+    fname <- paste0("chord_class_", trt_safe, "_", lvl)
+
+    draw_chord(mat_trt, ttl, tc, pv, str_to_title(lvl))
+
+    local({
+      m <- mat_trt; t <- ttl; colours <- tc; phyla <- pv; lbl <- str_to_title(lvl); fn <- fname
+      save_chord(fn, function() draw_chord(m, t, colours, phyla, lbl))
+    })
+
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+## Gene-level Chord Diagrams
+
+Individual resistance genes (coloured by their resistance class) linked to taxonomy.
+Genes with fewer than 5 reads across all samples are excluded for readability.
+
+### 8.5 Gene Level - Family - All Samples
+
+```{r chord-gene-family-all, fig.width=16, fig.height=16}
+if (nrow(mat_gene_family) >= 2 && ncol(mat_gene_family) >= 2) {
+  draw_chord(mat_gene_family,
+             "AMR Resistance Gene by Family (All Samples)",
+             family_colours, family_phylum_v, "Family",
+             row_colours = gene_row_colours)
+
+  save_chord("chord_gene_family_all",
+             function() draw_chord(mat_gene_family,
+               "AMR Resistance Gene by Family (All Samples)",
+               family_colours, family_phylum_v, "Family",
+               row_colours = gene_row_colours),
+             width = 16, height = 16)
+} else {
+  cat("Insufficient gene-level family data for combined chord diagram.\n")
+}
+```
+
+### 8.5a Gene by Family - Graphical Abstract Version
+
+Clinically concerning acquired resistance genes only; intrinsic/chromosomal
+genes are excluded. Remaining genes are ranked by read count and the top 20
+are shown. Larger labels and legends ensure legibility at reduced scale.
+Saved as `chord_gene_family_graphical_abstract_nobg.png` (transparent background).
+
+**Excluded gene groups (intrinsic/constitutive — not acquired):**
+
+| Pattern | Gene / organism | Reason excluded |
+|---|---|---|
+| `blaEC-*` | Chromosomal AmpC | Intrinsic in *Escherichia coli* |
+| `cepA` | *Bacteroides* β-lactamase | Intrinsic in *Bacteroides* spp. |
+| `cblA` | *Bacteroides* β-lactamase | Intrinsic in *Bacteroides* spp. |
+| `oqxA`, `oqxB*` | OqxAB efflux | Chromosomal in *Klebsiella pneumoniae* |
+| `fosA*` | Fosfomycin resistance | Chromosomal in *Klebsiella* / *Pseudomonas* |
+
+```{r chord-gene-family-graphical-abstract, fig.width=20, fig.height=20}
+# ── Intrinsic/constitutive gene patterns to exclude ───────────────────────────
+# These are chromosomally encoded in their primary host and do not represent
+# acquired, mobile resistance of clinical concern.
+intrinsic_regex <- paste(
+  "^blaEC",      # chromosomal AmpC — intrinsic in E. coli
+  "^cepA$",      # intrinsic beta-lactamase in Bacteroides spp.
+  "^cblA$",      # intrinsic beta-lactamase in Bacteroides spp.
+  "^oqxA",       # OqxAB efflux pump — chromosomal in K. pneumoniae
+  "^oqxB",       # OqxAB efflux pump — chromosomal in K. pneumoniae
+  "^fosA",       # fosfomycin resistance — chromosomal in Klebsiella / Pseudomonas
+  sep = "|"
+)
+
+mat_ga_full <- build_mat_gene(taxonomy_clean, "family", min_reads = 3)
+
+# Remove intrinsic gene rows
+mat_ga_concern <- mat_ga_full[!grepl(intrinsic_regex, rownames(mat_ga_full),
+                                      ignore.case = TRUE), , drop = FALSE]
+
+# Drop columns that become empty after gene removal, then keep top 20 genes
+mat_ga_concern <- mat_ga_concern[, colSums(mat_ga_concern) > 0, drop = FALSE]
+top_genes <- names(sort(rowSums(mat_ga_concern), decreasing = TRUE)
+                   [seq_len(min(20, nrow(mat_ga_concern)))])
+mat_ga <- mat_ga_concern[top_genes, , drop = FALSE]
+
+cat("Genes excluded (intrinsic):\n")
+cat(paste(" ", grep(intrinsic_regex, rownames(mat_ga_full),
+                     value = TRUE, ignore.case = TRUE)), sep = "\n")
+cat("\nGenes retained (acquired / concerning):\n")
+cat(paste(" ", rownames(mat_ga)), sep = "\n")
+
+if (nrow(mat_ga) >= 2 && ncol(mat_ga) >= 2) {
+  draw_chord(mat_ga,
+             "Acquired AMR Genes by Family (All Samples)",
+             family_colours, family_phylum_v, "Family",
+             row_colours         = gene_row_colours,
+             label_cex           = 1.8,
+             legend_cex          = 2.0,
+             label_track         = 35,
+             label_y_frac        = 0.1,
+             canvas_expand       = 1.15,
+             show_phylum_legend  = FALSE)
+
+  save_chord("chord_gene_family_graphical_abstract",
+             function() draw_chord(mat_ga,
+               "Acquired AMR Genes by Family (All Samples)",
+               family_colours, family_phylum_v, "Family",
+               row_colours        = gene_row_colours,
+               label_cex          = 1.8,
+               legend_cex         = 2.0,
+               label_track        = 35,
+               label_y_frac       = 0.1,
+               canvas_expand      = 1.15,
+               show_phylum_legend = FALSE),
+             width = 20, height = 20)
+} else {
+  cat("Insufficient data after intrinsic gene removal.\n")
+}
+```
+
+### 8.6 Gene Level - Genus - All Samples
+
+```{r chord-gene-genus-all, fig.width=16, fig.height=16}
+if (nrow(mat_gene_genus) >= 2 && ncol(mat_gene_genus) >= 2) {
+  draw_chord(mat_gene_genus,
+             "AMR Resistance Gene by Genus (All Samples)",
+             genus_colours, genus_phylum_v, "Genus",
+             row_colours = gene_row_colours)
+
+  save_chord("chord_gene_genus_all",
+             function() draw_chord(mat_gene_genus,
+               "AMR Resistance Gene by Genus (All Samples)",
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours = gene_row_colours),
+             width = 16, height = 16)
+} else {
+  cat("Insufficient gene-level genus data for combined chord diagram.\n")
+}
+```
+
+### 8.7 Gene Level - Species - All Samples
+
+```{r chord-gene-species-all, fig.width=16, fig.height=16}
+if (nrow(mat_gene_species) >= 2 && ncol(mat_gene_species) >= 2) {
+  draw_chord(mat_gene_species,
+             "AMR Resistance Gene by Species (All Samples)",
+             species_colours, species_phylum_v, "Species",
+             row_colours = gene_row_colours)
+
+  save_chord("chord_gene_species_all",
+             function() draw_chord(mat_gene_species,
+               "AMR Resistance Gene by Species (All Samples)",
+               species_colours, species_phylum_v, "Species",
+               row_colours = gene_row_colours),
+             width = 16, height = 16)
+} else {
+  cat("Insufficient gene-level species data for combined chord diagram.\n")
+}
+```
+
+### 8.8 Per-treatment Chord Diagrams - Gene by Genus
+
+```{r chord-gene-per-treatment, fig.width=16, fig.height=16, results='asis'}
+treatment_labels <- c(
+  "EVI_RVS" = "Post-Evisceration (RVS Enrichment)",
+  "EVI_CAT" = "Post-Evisceration (BF Bolton + CAT Enrichment)",
+  "ASC_RVS" = "Post-ASC Wash (RVS Enrichment)",
+  "ASC_CAT" = "Post-ASC Wash (BF Bolton + CAT Enrichment)"
+)
+
+for (trt in treatments) {
+  df_trt   <- taxonomy_clean %>% filter(treatment == trt)
+  trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+  trt_long <- treatment_labels[trt]
+
+  mat_trt <- build_mat_gene(df_trt, taxon_col = "genus", min_reads = 3)
+
+  if (nrow(mat_trt) < 2 || ncol(mat_trt) < 2) {
+    cat("\n#### ", trt_long, "\n\nInsufficient data.\n\n")
+    next
+  }
+
+  cat("\n#### ", trt_long, "\n\n")
+
+  ttl   <- paste0("AMR Resistance Gene by Genus: ", trt_long)
+  fname <- paste0("chord_gene_genus_", trt_safe)
+
+  draw_chord(mat_trt, ttl, genus_colours, genus_phylum_v, "Genus",
+             row_colours = gene_row_colours)
+
+  local({
+    m <- mat_trt; t <- ttl; fn <- fname
+    save_chord(fn, function() draw_chord(m, t, genus_colours, genus_phylum_v,
+                                          "Genus", row_colours = gene_row_colours),
+               width = 16, height = 16)
+  })
+
+  cat("\n\n")
+}
+```
+
+---
+
+## 9. Summary Tables
+
+### 9.1 Read counts per resistance class by genus
+
+```{r table-all}
+taxonomy_clean %>%
+  count(treatment, res_class, genus) %>%
+  arrange(treatment, desc(n)) %>%
+  kable(caption = "Read counts per treatment, resistance class, and genus") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+### 9.2 MEGARes hit summary
+
+```{r dedup-summary}
+dedup %>%
+  count(treatment, sample_id, name = "megares_hits") %>%
+  left_join(
+    raw %>% count(treatment, sample_id, name = "total_raw_hits"),
+    by = c("treatment", "sample_id")
+  ) %>%
+  mutate(pct_megares = round(100 * megares_hits / total_raw_hits, 1)) %>%
+  kable(caption = "MEGARes hits per sample (all reads, no deduplication)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## 10. Gene-level Co-occurrence Analysis
+
+Gene co-occurrence is measured as **Jaccard similarity**: J(A,B) = |A∩B| / |A∪B|,
+where A and B are the sets of samples in which each gene was detected.
+A score of 1 means the two genes always appear together; 0 means never.
+
+A gene is counted as *present* in a sample if at least one de-duplicated read
+from that sample was assigned to it.
+
+```{r cooc-setup}
+heatmap_colors <- colorRampPalette(c("#FFFFFF", "#FFF3CD", "#FF9B00", "#D62728"))(100)
+
+# ── Gene presence/absence: gene detected in ≥1 read per sample ───────────────
+build_read_pres_mat <- function(df) {
+  df %>%
+    distinct(gene_norm, sample_id) %>%
+    mutate(present = 1L) %>%
+    pivot_wider(names_from  = sample_id,
+                values_from = present, values_fill = 0L) %>%
+    column_to_rownames("gene_norm") %>%
+    as.matrix()
+}
+
+# ── Pairwise Jaccard similarity matrix ───────────────────────────────────────
+jaccard_matrix <- function(mat) {
+  n     <- nrow(mat)
+  genes <- rownames(mat)
+  jac   <- matrix(0, n, n, dimnames = list(genes, genes))
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      a <- mat[i, ]; b <- mat[j, ]
+      inter <- sum(a == 1L & b == 1L)
+      uni   <- sum(a == 1L | b == 1L)
+      jac[i, j] <- if (uni == 0) 0 else inter / uni
+    }
+  }
+  jac
+}
+
+# ── Co-occurrence heatmap ─────────────────────────────────────────────────────
+plot_cooccurrence <- function(jac_mat, gene_class_df, title,
+                               max_genes = 60, save_name = NULL) {
+  if (nrow(jac_mat) > max_genes) {
+    top_genes <- names(sort(rowMeans(jac_mat), decreasing = TRUE)[seq_len(max_genes)])
+    jac_mat   <- jac_mat[top_genes, top_genes]
+    title     <- paste0(title, "\n(top ", max_genes, " genes by mean co-occurrence)")
+  }
+
+  ann_df <- gene_class_df %>%
+    filter(gene_norm %in% rownames(jac_mat)) %>%
+    distinct(gene_norm, .keep_all = TRUE) %>%
+    select(gene_norm, res_class) %>%
+    column_to_rownames("gene_norm")
+  ann_df <- ann_df[rownames(jac_mat), , drop = FALSE]
+
+  p <- pheatmap(
+    jac_mat,
+    color                    = heatmap_colors,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method        = "ward.D2",
+    annotation_row           = ann_df,
+    annotation_col           = ann_df,
+    show_rownames            = nrow(jac_mat) <= 60,
+    show_colnames            = ncol(jac_mat) <= 60,
+    fontsize_row             = if (nrow(jac_mat) > 40) 5.5 else 7,
+    fontsize_col             = if (ncol(jac_mat) > 40) 5.5 else 7,
+    main                     = title,
+    border_color             = NA,
+    legend_breaks            = c(0, 0.25, 0.5, 0.75, 1),
+    legend_labels            = c("0.00", "0.25", "0.50", "0.75", "1.00"),
+    breaks                   = seq(0, 1, length.out = 101),
+    silent                   = TRUE
+  )
+
+  if (!is.null(save_name)) {
+    ggsave(file.path(plot_dir, paste0(save_name, ".png")),
+           plot = p$gtable, width = 13, height = 11, dpi = 300)
+    ggsave(file.path(plot_dir, paste0(save_name, ".pdf")),
+           plot = p$gtable, width = 13, height = 11)
+  }
+  print(p)
+}
+
+```
+
+### 10.1 Per-treatment Co-occurrence Heatmaps
+
+```{r cooc-heatmaps, fig.width=13, fig.height=11, results='asis'}
+# Gene metadata: one row per (treatment, gene_norm).
+# Use the most-detected res_class to avoid duplicated vertex names in igraph
+# when the same gene appears under multiple resistance classes across databases.
+gene_meta <- taxonomy_clean %>%
+  group_by(treatment, gene_norm, res_class) %>%
+  summarise(sample_count = n_distinct(sample_id), .groups = "drop") %>%
+  group_by(treatment, gene_norm) %>%
+  slice_max(sample_count, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+pres_mats <- list()
+jac_mats  <- list()
+
+for (trt in treatments) {
+  df_trt  <- taxonomy_clean %>% filter(treatment == trt)
+  gm_trt  <- gene_meta    %>% filter(treatment == trt)
+
+  pres_mats[[trt]] <- build_read_pres_mat(df_trt)
+  jac_mats[[trt]]  <- jaccard_matrix(pres_mats[[trt]])
+
+  trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+  cat("\n#### ", trt, "\n\n")
+
+  plot_cooccurrence(
+    jac_mats[[trt]], gm_trt,
+    paste0("AMR Gene Co-occurrence: ", trt),
+    save_name = paste0("cooc_heatmap_", trt_safe)
+  )
+  cat("\n\n")
+}
+```
+
+### 10.2 Top Co-occurring Gene Pairs
+
+```{r cooc-top-pairs}
+top_gene_pairs <- function(jac_mat, trt, threshold = 0.75) {
+  melt(jac_mat, varnames = c("Gene1", "Gene2"), value.name = "Jaccard") %>%
+    filter(as.character(Gene1) < as.character(Gene2), Jaccard >= threshold) %>%
+    arrange(desc(Jaccard)) %>%
+    mutate(Treatment = trt) %>%
+    select(Treatment, Gene1, Gene2, Jaccard)
+}
+
+# bind_rows preserves column names even when all component frames are empty,
+# unlike map_dfr which can collapse to a zero-column tibble.
+pairs_all <- map(treatments, function(trt) top_gene_pairs(jac_mats[[trt]], trt)) %>%
+  bind_rows()
+
+if (nrow(pairs_all) > 0) {
+  kable(pairs_all, digits = 3,
+        caption = "Gene pairs with Jaccard co-occurrence ≥ 0.75") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+} else {
+  cat("No gene pairs exceed Jaccard 0.75. Showing top 20 across all treatments:\n")
+  top20 <- map(treatments, function(trt) top_gene_pairs(jac_mats[[trt]], trt, 0)) %>%
+    bind_rows()
+  if (nrow(top20) > 0) {
+    top20 %>%
+      arrange(desc(Jaccard)) %>%
+      slice_head(n = 20) %>%
+      kable(digits = 3, caption = "Top 20 gene pairs by co-occurrence") %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+  } else {
+    cat("No gene pairs found across any treatment (all matrices have fewer than 2 genes).\n")
+  }
+}
+```
+
+### 10.3 All-treatments Combined Co-occurrence Heatmap
+
+Genes detected in ≥ 2 samples across all treatments are pooled into a single
+presence/absence matrix. The resulting Jaccard co-occurrence heatmap gives an
+overview of gene pairs that consistently appear together across the full dataset,
+independent of treatment group. Resistance-class annotation is shown on both axes.
+
+```{r cooc-combined, fig.width=14, fig.height=13}
+# Pool all samples across treatments; each column = one sample
+pres_all <- taxonomy_clean %>%
+  distinct(gene_norm, sample_id) %>%
+  mutate(present = 1L) %>%
+  pivot_wider(names_from = sample_id, values_from = present, values_fill = 0L) %>%
+  column_to_rownames("gene_norm") %>%
+  as.matrix()
+
+# Determine the minimum sample threshold adaptively:
+# prefer genes in ≥2 samples, but fall back to ≥1 if too few genes survive.
+n_samples   <- ncol(pres_all)
+min_samples <- if (n_samples >= 4) 2L else 1L
+pres_all    <- pres_all[rowSums(pres_all) >= min_samples, , drop = FALSE]
+
+cat("Genes retained (present in ≥", min_samples, "samples):", nrow(pres_all), "\n")
+
+if (nrow(pres_all) < 2) {
+  cat("Fewer than 2 genes passed the filter - combined heatmap cannot be drawn.\n",
+      "Consider lowering min_reads in build_mat_gene or checking MEGARes gene coverage.\n")
+} else {
+
+  jac_all <- jaccard_matrix(pres_all)
+
+  # Resistance-class annotation for rows/cols
+  ann_all <- gene_meta %>%
+    distinct(gene_norm, .keep_all = TRUE) %>%
+    filter(gene_norm %in% rownames(jac_all)) %>%
+    select(gene_norm, res_class) %>%
+    column_to_rownames("gene_norm")
+  ann_all <- ann_all[rownames(jac_all), , drop = FALSE]
+  names(ann_all) <- "Resistance class"
+
+  ann_colours <- list(
+    `Resistance class` = res_class_colours[intersect(names(res_class_colours),
+                                                      unique(ann_all[["Resistance class"]]))]
+  )
+
+  n    <- nrow(jac_all)
+  fnt  <- if (n > 40) 5.5 else 7
+  w    <- max(12, min(22, n * 0.3 + 6))
+  h    <- max(10, min(20, n * 0.3 + 4))
+
+  p_all <- pheatmap(
+    jac_all,
+    color                    = heatmap_colors,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method        = "ward.D2",
+    annotation_row           = ann_all,
+    annotation_col           = ann_all,
+    annotation_colors        = ann_colours,
+    show_rownames            = TRUE,
+    show_colnames            = TRUE,
+    fontsize_row             = fnt,
+    fontsize_col             = fnt,
+    main                     = "AMR Gene Co-occurrence (All Samples)",
+    border_color             = NA,
+    legend_breaks            = c(0, 0.25, 0.5, 0.75, 1),
+    legend_labels            = c("0.00", "0.25", "0.50", "0.75", "1.00"),
+    breaks                   = seq(0, 1, length.out = 101),
+    silent                   = TRUE
+  )
+
+  ggsave(file.path(plot_dir, "cooc_heatmap_all_combined.png"),
+         plot = p_all$gtable, width = w, height = h, dpi = 300)
+  ggsave(file.path(plot_dir, "cooc_heatmap_all_combined.pdf"),
+         plot = p_all$gtable, width = w, height = h)
+  print(p_all)
+}
+```
+
+---
+
+## 12. Feature-specific Chord Diagrams
+
+Chord diagrams for three additional gene categories using ABRicate databases
+beyond ResFinder. Each read is deduplicated per READ_ID by normalised gene name
+(highest %IDENTITY kept). Genus assignment uses the same Kraken2 taxonomy and
+phylum lookup as the main analysis.
+
+```{r feature-helpers}
+# ── Build deduplicated, genus-annotated data frame from selected databases ─────
+build_feature_data <- function(databases, resistance_pattern = NULL,
+                                min_identity = 80) {
+  avail <- intersect(databases, unique(raw$DATABASE))
+  if (length(avail) == 0) return(tibble())
+
+  d <- raw %>%
+    filter(DATABASE %in% avail,
+           !is.na(GENE), GENE != "",
+           !is.na(TAXONOMY), TAXONOMY != "",
+           as.numeric(`%IDENTITY`) >= min_identity)
+
+  if (!is.null(resistance_pattern))
+    d <- filter(d, str_detect(str_to_lower(coalesce(RESISTANCE, "")),
+                              resistance_pattern))
+
+  d %>%
+    mutate(gene_norm = str_to_lower(GENE) %>%
+             str_remove("_[0-9]+$") %>% str_trim()) %>%
+    group_by(sample_id, treatment, READ_ID, gene_norm) %>%
+    slice_max(as.numeric(`%IDENTITY`), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      genus  = word(TAXONOMY, 1),
+      phylum = phylum_lookup[genus],
+      genus  = if_else(is.na(phylum), "Unclassified", genus)
+    )
+}
+
+# ── Assign colours to gene_norm based on functional category (RESISTANCE field)
+build_gene_cat_colours <- function(df, palette_fn) {
+  cat_lut <- df %>%
+    distinct(gene_norm, RESISTANCE) %>%
+    mutate(category = str_to_lower(str_trim(
+      str_extract(coalesce(RESISTANCE, "unknown"), "^[^;,/]+")))
+    ) %>%
+    group_by(gene_norm) %>%
+    slice(1) %>%
+    ungroup()
+
+  unique_cats <- sort(unique(cat_lut$category))
+  cat_pal     <- setNames(palette_fn(length(unique_cats)), unique_cats)
+
+  list(
+    gene_colours = setNames(cat_pal[cat_lut$category], cat_lut$gene_norm),
+    cat_colours  = cat_pal
+  )
+}
+```
+
+---
+
+### 12.1 Efflux Pump Genes by Genus
+
+Efflux pump genes are extracted from CARD, NCBI, and MEGARes databases by
+filtering for "efflux", "pump", or "multidrug" in the RESISTANCE annotation.
+Genes are coloured by efflux category as annotated by the database.
+
+```{r efflux-data}
+efflux_data <- build_feature_data(
+  databases          = c("card", "ncbi", "megares"),
+  resistance_pattern = "efflux|pump|multidrug|mdr"
+)
+
+cat("Databases used:", paste(intersect(c("card","ncbi","megares"), unique(raw$DATABASE)),
+                              collapse = ", "), "\n")
+cat("Reads:", nrow(efflux_data), "| Unique genes:", n_distinct(efflux_data$gene_norm),
+    "| Genera:", n_distinct(efflux_data$genus[efflux_data$genus != "Unclassified"]), "\n")
+```
+
+```{r efflux-chord-all, fig.width=16, fig.height=16}
+if (nrow(efflux_data) > 0) {
+  efflux_cols <- build_gene_cat_colours(
+    efflux_data,
+    colorRampPalette(c("#FF6600", "#D62728", "#8B1A1A", "#FF9944", "#CC3300"))
+  )
+
+  mat_efflux <- build_mat_gene(efflux_data, "genus", min_reads = 3, top_n = 40)
+
+  if (nrow(mat_efflux) >= 2 && ncol(mat_efflux) >= 2) {
+    ec <- efflux_cols$gene_colours[rownames(mat_efflux)]
+    ec[is.na(ec)] <- "#AAAAAA"
+
+    draw_chord(mat_efflux,
+               "Efflux Pump Genes by Genus (All Samples)",
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours      = ec,
+               row_legend_cols  = efflux_cols$cat_colours,
+               row_legend_title = "Efflux category")
+
+    save_chord("chord_efflux_genus_all",
+               function() {
+                 ec2 <- efflux_cols$gene_colours[rownames(mat_efflux)]
+                 ec2[is.na(ec2)] <- "#AAAAAA"
+                 draw_chord(mat_efflux,
+                            "Efflux Pump Genes by Genus (All Samples)",
+                            genus_colours, genus_phylum_v, "Genus",
+                            row_colours = ec2,
+                            row_legend_cols = efflux_cols$cat_colours,
+                            row_legend_title = "Efflux category")
+               }, width = 16, height = 16)
+  } else {
+    cat("Insufficient efflux data (need ≥2 genes and ≥2 genera after min_reads filter).\n")
+  }
+} else {
+  cat("No efflux pump reads found in the loaded databases.\n")
+}
+```
+
+```{r efflux-chord-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(efflux_data) > 0) {
+  for (trt in treatments) {
+    df_trt   <- efflux_data %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+    mat_trt  <- build_mat_gene(df_trt, "genus", min_reads = 2, top_n = 40)
+
+    if (nrow(mat_trt) < 2 || ncol(mat_trt) < 2) next
+
+    cat("\n####", trt_long, "\n\n")
+
+    ec <- efflux_cols$gene_colours[rownames(mat_trt)]
+    ec[is.na(ec)] <- "#AAAAAA"
+
+    draw_chord(mat_trt, paste0("Efflux Pump Genes by Genus: ", trt_long),
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours = ec, row_legend_cols = efflux_cols$cat_colours,
+               row_legend_title = "Efflux category")
+
+    local({
+      m  <- mat_trt; fn <- paste0("chord_efflux_genus_", trt_safe)
+      t  <- paste0("Efflux Pump Genes by Genus: ", trt_long)
+      lc <- efflux_cols$cat_colours
+      rc <- ec
+      save_chord(fn, function() draw_chord(m, t, genus_colours, genus_phylum_v,
+                                            "Genus", row_colours = rc,
+                                            row_legend_cols = lc,
+                                            row_legend_title = "Efflux category"),
+                 width = 16, height = 16)
+    })
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+### 12.2 Virulence Factor Genes by Genus
+
+Virulence factor genes are extracted from the VFDB and ecoli_vf databases.
+Genes are coloured by virulence factor category (e.g. toxin, adhesin, iron
+acquisition) as annotated in the RESISTANCE/function field.
+
+```{r virulence-data}
+vf_data <- build_feature_data(
+  databases     = c("vfdb", "ecoli_vf"),
+  min_identity  = 80
+)
+
+cat("Databases used:", paste(intersect(c("vfdb","ecoli_vf"), unique(raw$DATABASE)),
+                              collapse = ", "), "\n")
+cat("Reads:", nrow(vf_data), "| Unique genes:", n_distinct(vf_data$gene_norm),
+    "| Genera:", n_distinct(vf_data$genus[vf_data$genus != "Unclassified"]), "\n")
+```
+
+```{r virulence-chord-all, fig.width=16, fig.height=16}
+if (nrow(vf_data) > 0) {
+  vf_cols <- build_gene_cat_colours(
+    vf_data,
+    colorRampPalette(c("#7B2D8B", "#C463D7", "#E8A0F0", "#9E3BAB",
+                       "#5C1A6B", "#D966E8", "#B34FCC", "#802B99"))
+  )
+
+  mat_vf <- build_mat_gene(vf_data, "genus", min_reads = 3, top_n = 40)
+
+  if (nrow(mat_vf) >= 2 && ncol(mat_vf) >= 2) {
+    vc <- vf_cols$gene_colours[rownames(mat_vf)]
+    vc[is.na(vc)] <- "#AAAAAA"
+
+    draw_chord(mat_vf,
+               "Virulence Factor Genes by Genus (All Samples)",
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours      = vc,
+               row_legend_cols  = vf_cols$cat_colours,
+               row_legend_title = "Virulence factor\ncategory")
+
+    save_chord("chord_virulence_genus_all",
+               function() {
+                 vc2 <- vf_cols$gene_colours[rownames(mat_vf)]
+                 vc2[is.na(vc2)] <- "#AAAAAA"
+                 draw_chord(mat_vf,
+                            "Virulence Factor Genes by Genus (All Samples)",
+                            genus_colours, genus_phylum_v, "Genus",
+                            row_colours = vc2,
+                            row_legend_cols = vf_cols$cat_colours,
+                            row_legend_title = "Virulence factor\ncategory")
+               }, width = 16, height = 16)
+  } else {
+    cat("Insufficient virulence data (need ≥2 genes and ≥2 genera after min_reads filter).\n")
+  }
+} else {
+  cat("No virulence factor reads found in the loaded databases.\n")
+}
+```
+
+```{r virulence-chord-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(vf_data) > 0) {
+  for (trt in treatments) {
+    df_trt   <- vf_data %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+    mat_trt  <- build_mat_gene(df_trt, "genus", min_reads = 2, top_n = 40)
+
+    if (nrow(mat_trt) < 2 || ncol(mat_trt) < 2) next
+
+    cat("\n####", trt_long, "\n\n")
+
+    vc <- vf_cols$gene_colours[rownames(mat_trt)]
+    vc[is.na(vc)] <- "#AAAAAA"
+
+    draw_chord(mat_trt, paste0("Virulence Factor Genes by Genus: ", trt_long),
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours = vc, row_legend_cols = vf_cols$cat_colours,
+               row_legend_title = "Virulence factor\ncategory")
+
+    local({
+      m  <- mat_trt; fn <- paste0("chord_virulence_genus_", trt_safe)
+      t  <- paste0("Virulence Factor Genes by Genus: ", trt_long)
+      lc <- vf_cols$cat_colours; rc <- vc
+      save_chord(fn, function() draw_chord(m, t, genus_colours, genus_phylum_v,
+                                            "Genus", row_colours = rc,
+                                            row_legend_cols = lc,
+                                            row_legend_title = "Virulence factor\ncategory"),
+                 width = 16, height = 16)
+    })
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+### 12.3 Plasmid Replicons by Genus
+
+Plasmid replicon sequences are extracted from the PlasmidFinder database.
+Replicons (row sectors) are coloured by incompatibility group family; genera
+(column sectors) are coloured by phylum as in all other diagrams.
+
+```{r plasmid-data}
+plasmid_data <- build_feature_data(
+  databases    = "plasmidfinder",
+  min_identity = 80
+)
+
+cat("Databases used:", paste(intersect("plasmidfinder", unique(raw$DATABASE)),
+                              collapse = ", "), "\n")
+cat("Reads:", nrow(plasmid_data), "| Unique replicons:", n_distinct(plasmid_data$gene_norm),
+    "| Genera:", n_distinct(plasmid_data$genus[plasmid_data$genus != "Unclassified"]), "\n")
+```
+
+```{r plasmid-chord-all, fig.width=16, fig.height=16}
+if (nrow(plasmid_data) > 0) {
+  # Colour replicons by incompatibility group family (prefix before underscore or digit)
+  plasmid_data <- plasmid_data %>%
+    mutate(inc_group = str_extract(gene_norm, "^[a-z]+"))
+
+  inc_groups  <- sort(unique(plasmid_data$inc_group))
+  inc_pal     <- setNames(
+    colorRampPalette(c("#006D2C", "#31A354", "#74C476", "#BAE4B3",
+                       "#00441B", "#238B45", "#41AE76", "#66C2A4"))(length(inc_groups)),
+    inc_groups
+  )
+
+  plasmid_gene_cols <- plasmid_data %>%
+    distinct(gene_norm, inc_group) %>%
+    mutate(colour = inc_pal[inc_group]) %>%
+    { setNames(.$colour, .$gene_norm) }
+
+  mat_plasmid <- build_mat_gene(plasmid_data, "genus", min_reads = 3, top_n = 40)
+
+  if (nrow(mat_plasmid) >= 2 && ncol(mat_plasmid) >= 2) {
+    pc <- plasmid_gene_cols[rownames(mat_plasmid)]
+    pc[is.na(pc)] <- "#AAAAAA"
+
+    draw_chord(mat_plasmid,
+               "Plasmid Replicons by Genus (All Samples)",
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours      = pc,
+               row_legend_cols  = inc_pal,
+               row_legend_title = "Incompatibility\ngroup family")
+
+    save_chord("chord_plasmid_genus_all",
+               function() {
+                 pc2 <- plasmid_gene_cols[rownames(mat_plasmid)]
+                 pc2[is.na(pc2)] <- "#AAAAAA"
+                 draw_chord(mat_plasmid,
+                            "Plasmid Replicons by Genus (All Samples)",
+                            genus_colours, genus_phylum_v, "Genus",
+                            row_colours = pc2,
+                            row_legend_cols = inc_pal,
+                            row_legend_title = "Incompatibility\ngroup family")
+               }, width = 16, height = 16)
+  } else {
+    cat("Insufficient plasmid data (need ≥2 replicons and ≥2 genera after min_reads filter).\n")
+  }
+} else {
+  cat("No plasmid replicon reads found in the loaded databases.\n")
+}
+```
+
+```{r plasmid-chord-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(plasmid_data) > 0) {
+  for (trt in treatments) {
+    df_trt   <- plasmid_data %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+    mat_trt  <- build_mat_gene(df_trt, "genus", min_reads = 2)
+
+    if (nrow(mat_trt) < 2 || ncol(mat_trt) < 2) next
+
+    cat("\n####", trt_long, "\n\n")
+
+    pc <- plasmid_gene_cols[rownames(mat_trt)]
+    pc[is.na(pc)] <- "#AAAAAA"
+
+    draw_chord(mat_trt, paste0("Plasmid Replicons by Genus: ", trt_long),
+               genus_colours, genus_phylum_v, "Genus",
+               row_colours = pc, row_legend_cols = inc_pal,
+               row_legend_title = "Incompatibility\ngroup family")
+
+    local({
+      m  <- mat_trt; fn <- paste0("chord_plasmid_genus_", trt_safe)
+      t  <- paste0("Plasmid Replicons by Genus: ", trt_long)
+      rc <- pc
+      save_chord(fn, function() draw_chord(m, t, genus_colours, genus_phylum_v,
+                                            "Genus", row_colours = rc,
+                                            row_legend_cols = inc_pal,
+                                            row_legend_title = "Incompatibility\ngroup family"),
+                 width = 16, height = 16)
+    })
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+---
+
+## 13. *Campylobacter*-only Chord Diagrams
+
+Reads where `genus == "Campylobacter"` are filtered from `taxonomy_clean`.
+Two chord diagrams are produced for each subset - one at **resistance class** level
+and one at **resistance gene** level. Both diagrams show resistance genes on one arc
+and resistance classes on the other, revealing the AMR profile specific to
+*Campylobacter*. Diagrams are generated for all samples combined and for each
+sample type separately.
+
+```{r campy-setup}
+tc_campy <- taxonomy_clean %>%
+  filter(genus == "Campylobacter",
+         res_class != "disinfectant/biocide")
+
+cat("Campylobacter reads:", nrow(tc_campy), "\n")
+cat("Treatments present:", paste(sort(unique(tc_campy$treatment)), collapse = ", "), "\n")
+cat("Species found:",
+    paste(sort(unique(tc_campy$species[tc_campy$species != "Unclassified"])), collapse = ", "),
+    "\n")
+cat("Resistance classes:", paste(sort(unique(tc_campy$res_class)), collapse = ", "), "\n")
+cat("Unique genes:",       n_distinct(tc_campy$gene_norm), "\n")
+```
+
+```{r campy-matrix-helper}
+# Build a gene_norm by res_class count matrix (Campylobacter-specific)
+# Used for both the class-level and gene-level Campy chords.
+build_campy_mat <- function(df, min_reads = 1) {
+  mat <- df %>%
+    count(gene_norm, res_class) %>%
+    pivot_wider(names_from = res_class, values_from = n, values_fill = 0L) %>%
+    column_to_rownames("gene_norm") %>%
+    as.matrix()
+  mat[rowSums(mat) >= min_reads, colSums(mat) >= min_reads, drop = FALSE]
+}
+
+# Draw a Campylobacter gene by class chord using draw_chord.
+# Row sectors = genes (coloured by resistance class).
+# Column sectors = resistance classes (coloured by res_class_colours).
+draw_campy_chord <- function(df, title, min_reads = 1, save_name = NULL,
+                              width = 16, height = 16) {
+  mat <- build_campy_mat(df, min_reads)
+
+  if (nrow(mat) < 2 || ncol(mat) < 2) {
+    message(title, ": insufficient data - skipping.")
+    return(invisible(NULL))
+  }
+
+  # Column sectors are resistance classes; colour them directly
+  tc <- res_class_colours[colnames(mat)]
+  tc[is.na(tc)] <- "#AAAAAA"
+
+  # phylum_of_taxon drives the bottomright phylum legend - pass NA vector to suppress it
+  po <- setNames(rep(NA_character_, ncol(mat)), colnames(mat))
+
+  draw_chord(mat, title,
+             taxon_colours    = tc,
+             phylum_of_taxon  = po,
+             level_label      = "Resistance class",
+             row_colours      = gene_row_colours,
+             row_legend_title = "Resistance gene\n(by class colour)")
+
+  if (!is.null(save_name)) {
+    local({
+      m <- mat; t <- title; tc2 <- tc; po2 <- po
+      save_chord(save_name,
+                 function() draw_chord(m, t,
+                                       taxon_colours   = tc2,
+                                       phylum_of_taxon = po2,
+                                       level_label     = "Resistance class",
+                                       row_colours     = gene_row_colours,
+                                       row_legend_title = "Resistance gene\n(by class colour)"),
+                 width = width, height = height)
+    })
+  }
+}
+```
+
+### 13.1 *Campylobacter* - Resistance Class Level - All Samples
+
+```{r campy-class-all, fig.width=16, fig.height=16}
+if (nrow(tc_campy) > 0) {
+  draw_campy_chord(
+    tc_campy,
+    title     = expression(italic("Campylobacter") ~ "AMR Resistance Gene by Class (All Samples)"),
+    min_reads = 1,
+    save_name = "chord_campy_class_all"
+  )
+} else {
+  cat("No Campylobacter reads found in the dataset.\n")
+}
+```
+
+### 13.2 *Campylobacter* - Gene Level - All Samples
+
+```{r campy-gene-all, fig.width=16, fig.height=16}
+if (nrow(tc_campy) > 0) {
+  draw_campy_chord(
+    tc_campy,
+    title     = expression(italic("Campylobacter") ~ "AMR Resistance Gene by Class (All Samples, Gene-Level View)"),
+    min_reads = 1,
+    save_name = "chord_campy_gene_all"
+  )
+}
+```
+
+### 13.3 *Campylobacter* - Resistance Class Level - Per Treatment
+
+```{r campy-class-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(tc_campy) > 0) {
+  for (trt in sort(unique(tc_campy$treatment))) {
+    df_trt   <- tc_campy %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+
+    mat_check <- build_campy_mat(df_trt, min_reads = 1)
+    if (nrow(mat_check) < 2 || ncol(mat_check) < 2) {
+      cat("\n####", trt_long, "\n\nInsufficient Campylobacter data.\n\n")
+      next
+    }
+
+    cat("\n####", trt_long, "\n\n")
+
+    draw_campy_chord(
+      df_trt,
+      title     = bquote(italic("Campylobacter") ~ "AMR Resistance Gene by Class:" ~ .(trt_long)),
+      min_reads = 1,
+      save_name = paste0("chord_campy_class_", trt_safe)
+    )
+
+    cat("\n\n")
+  }
+}
+```
+
+### 13.4 *Campylobacter* - Gene Level - Per Treatment
+
+```{r campy-gene-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(tc_campy) > 0) {
+  for (trt in sort(unique(tc_campy$treatment))) {
+    df_trt   <- tc_campy %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+
+    mat_check <- build_campy_mat(df_trt, min_reads = 1)
+    if (nrow(mat_check) < 2 || ncol(mat_check) < 2) next
+
+    cat("\n####", trt_long, "\n\n")
+
+    draw_campy_chord(
+      df_trt,
+      title     = bquote(italic("Campylobacter") ~ "AMR Resistance Gene by Class (Gene-Level View):" ~ .(trt_long)),
+      min_reads = 1,
+      save_name = paste0("chord_campy_gene_", trt_safe)
+    )
+
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+## 14. *Escherichia*-only Chord Diagrams
+
+```{r ecoli-setup}
+tc_ecoli <- taxonomy_clean %>%
+  filter(genus == "Escherichia",
+         res_class != "disinfectant/biocide")
+
+cat("Escherichia reads:", nrow(tc_ecoli), "\n")
+cat("Treatments present:", paste(sort(unique(tc_ecoli$treatment)), collapse = ", "), "\n")
+cat("Resistance classes:", paste(sort(unique(tc_ecoli$res_class)), collapse = ", "), "\n")
+cat("Unique genes:",       n_distinct(tc_ecoli$gene_norm), "\n")
+```
+
+### 14.1 *Escherichia* - Resistance Class Level - All Samples
+
+```{r ecoli-class-all, fig.width=16, fig.height=16}
+if (nrow(tc_ecoli) > 0) {
+  draw_campy_chord(
+    tc_ecoli,
+    title     = expression(italic("Escherichia") ~ "AMR Resistance Gene by Class (All Samples)"),
+    min_reads = 1,
+    save_name = "chord_ecoli_class_all"
+  )
+} else {
+  cat("No Escherichia reads found in the dataset.\n")
+}
+```
+
+### 14.2 *Escherichia* - Gene Level - All Samples
+
+```{r ecoli-gene-all, fig.width=16, fig.height=16}
+if (nrow(tc_ecoli) > 0) {
+  draw_campy_chord(
+    tc_ecoli,
+    title     = expression(italic("Escherichia") ~ "AMR Resistance Gene by Class (All Samples, Gene-Level View)"),
+    min_reads = 1,
+    save_name = "chord_ecoli_gene_all"
+  )
+}
+```
+
+### 14.3 *Escherichia* - Resistance Class Level - Per Treatment
+
+```{r ecoli-class-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(tc_ecoli) > 0) {
+  for (trt in sort(unique(tc_ecoli$treatment))) {
+    df_trt   <- tc_ecoli %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+
+    mat_check <- build_campy_mat(df_trt, min_reads = 1)
+    if (nrow(mat_check) < 2 || ncol(mat_check) < 2) {
+      cat("\n####", trt_long, "\n\nInsufficient Escherichia data.\n\n")
+      next
+    }
+
+    cat("\n####", trt_long, "\n\n")
+
+    draw_campy_chord(
+      df_trt,
+      title     = bquote(italic("Escherichia") ~ "AMR Resistance Gene by Class:" ~ .(trt_long)),
+      min_reads = 1,
+      save_name = paste0("chord_ecoli_class_", trt_safe)
+    )
+
+    cat("\n\n")
+  }
+}
+```
+
+### 14.4 *Escherichia* - Gene Level - Per Treatment
+
+```{r ecoli-gene-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(tc_ecoli) > 0) {
+  for (trt in sort(unique(tc_ecoli$treatment))) {
+    df_trt   <- tc_ecoli %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+
+    mat_check <- build_campy_mat(df_trt, min_reads = 1)
+    if (nrow(mat_check) < 2 || ncol(mat_check) < 2) next
+
+    cat("\n####", trt_long, "\n\n")
+
+    draw_campy_chord(
+      df_trt,
+      title     = bquote(italic("Escherichia") ~ "AMR Resistance Gene by Class (Gene-Level View):" ~ .(trt_long)),
+      min_reads = 1,
+      save_name = paste0("chord_ecoli_gene_", trt_safe)
+    )
+
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+## 15. *Klebsiella pneumoniae*-only Chord Diagrams
+
+Reads where `genus == "Klebsiella"` are filtered from `taxonomy_clean`.
+Reads classified only to genus level (no species epithet) are included alongside
+confirmed *K. pneumoniae* reads to maximise data; the majority of
+*Klebsiella* reads in this dataset are expected to be *K. pneumoniae*.
+
+```{r kpneu-setup}
+tc_kpneu <- taxonomy_clean %>%
+  filter(genus == "Klebsiella",
+         res_class != "disinfectant/biocide")
+
+cat("Klebsiella reads:", nrow(tc_kpneu), "\n")
+cat("Treatments present:", paste(sort(unique(tc_kpneu$treatment)), collapse = ", "), "\n")
+cat("Species found:",
+    paste(sort(unique(tc_kpneu$species[tc_kpneu$species != "Unclassified"])), collapse = ", "),
+    "\n")
+cat("Resistance classes:", paste(sort(unique(tc_kpneu$res_class)), collapse = ", "), "\n")
+cat("Unique genes:",       n_distinct(tc_kpneu$gene_norm), "\n")
+```
+
+### 15.1 *Klebsiella pneumoniae* - Resistance Class Level - All Samples
+
+```{r kpneu-class-all, fig.width=16, fig.height=16}
+if (nrow(tc_kpneu) > 0) {
+  draw_campy_chord(
+    tc_kpneu,
+    title     = expression(italic("Klebsiella pneumoniae") ~ "AMR Resistance Gene by Class (All Samples)"),
+    min_reads = 1,
+    save_name = "chord_kpneu_class_all"
+  )
+} else {
+  cat("No Klebsiella reads found in the dataset.\n")
+}
+```
+
+### 15.2 *Klebsiella pneumoniae* - Gene Level - All Samples
+
+```{r kpneu-gene-all, fig.width=16, fig.height=16}
+if (nrow(tc_kpneu) > 0) {
+  draw_campy_chord(
+    tc_kpneu,
+    title     = expression(italic("Klebsiella pneumoniae") ~ "AMR Resistance Gene by Class (All Samples, Gene-Level View)"),
+    min_reads = 1,
+    save_name = "chord_kpneu_gene_all"
+  )
+}
+```
+
+### 15.3 *Klebsiella pneumoniae* - Resistance Class Level - Per Treatment
+
+```{r kpneu-class-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(tc_kpneu) > 0) {
+  for (trt in sort(unique(tc_kpneu$treatment))) {
+    df_trt   <- tc_kpneu %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+
+    mat_check <- build_campy_mat(df_trt, min_reads = 1)
+    if (nrow(mat_check) < 2 || ncol(mat_check) < 2) {
+      cat("\n####", trt_long, "\n\nInsufficient *Klebsiella* data.\n\n")
+      next
+    }
+
+    cat("\n####", trt_long, "\n\n")
+
+    draw_campy_chord(
+      df_trt,
+      title     = bquote(italic("Klebsiella pneumoniae") ~ "AMR Resistance Gene by Class:" ~ .(trt_long)),
+      min_reads = 1,
+      save_name = paste0("chord_kpneu_class_", trt_safe)
+    )
+
+    cat("\n\n")
+  }
+}
+```
+
+### 15.4 *Klebsiella pneumoniae* - Gene Level - Per Treatment
+
+```{r kpneu-gene-per-treatment, fig.width=16, fig.height=16, results='asis'}
+if (nrow(tc_kpneu) > 0) {
+  for (trt in sort(unique(tc_kpneu$treatment))) {
+    df_trt   <- tc_kpneu %>% filter(treatment == trt)
+    trt_safe <- gsub("[^A-Za-z0-9]", "_", trt)
+    trt_long <- treatment_labels[trt]
+
+    mat_check <- build_campy_mat(df_trt, min_reads = 1)
+    if (nrow(mat_check) < 2 || ncol(mat_check) < 2) next
+
+    cat("\n####", trt_long, "\n\n")
+
+    draw_campy_chord(
+      df_trt,
+      title     = bquote(italic("Klebsiella pneumoniae") ~ "AMR Resistance Gene by Class (Gene-Level View):" ~ .(trt_long)),
+      min_reads = 1,
+      save_name = paste0("chord_kpneu_gene_", trt_safe)
+    )
+
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+## 11. Session Info
+
+```{r session-info, results='markup'}
+sessionInfo()
+```

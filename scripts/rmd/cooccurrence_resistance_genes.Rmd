@@ -1,0 +1,828 @@
+---
+title: "Resistance Gene Co-occurrence Analysis"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 10
+)
+
+# ── Output directory for saved plots ─────────────────────────────────────────
+plot_dir <- "/Users/alicebradbury/Desktop/cooccurrence_plots"
+dir.create(plot_dir, showWarnings = FALSE)
+```
+
+## Overview
+
+This analysis examines the co-occurrence of antimicrobial resistance (AMR) genes
+across samples from a poultry processing plant. Two treatment sites are compared:
+
+- **EVI** – Post manual evisceration
+- **ASC** – Post acidified sodium chlorite (ASC) wash
+
+Two enrichment broths per site:
+
+- **RVS broth enriched**
+- **Bolton broth + CAT enriched**
+
+Co-occurrence is calculated as the Jaccard similarity index (0 = never co-occur,
+1 = always co-occur) between gene presence/absence profiles across samples.
+The network graphs show genes as nodes (sized by number of detections, coloured
+by resistance class) with edges weighted by co-occurrence strength.
+
+---
+
+## 1. Setup
+
+```{r packages}
+library(readxl)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+library(ggplot2)
+library(stringr)
+library(reshape2)
+library(grid)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(ggrepel)
+library(patchwork)
+library(graphlayouts)
+```
+
+---
+
+## 2. Load and Combine Data
+
+```{r load-data}
+base_dir <- "/Users/alicebradbury/Desktop/ABRicate_dereplicated"
+
+# ── Descriptive dataset labels ────────────────────────────────────────────────
+dataset_labels <- c(
+  "EVI_RVS" = "Post Evisceration – RVS Broth Enriched",
+  "EVI_CAT" = "Post Evisceration – Bolton Broth + CAT Enriched",
+  "ASC_RVS" = "Post ASC Wash – RVS Broth Enriched",
+  "ASC_CAT" = "Post ASC Wash – Bolton Broth + CAT Enriched"
+)
+
+read_abricate <- function(path, dataset_label) {
+  df <- read_excel(path)
+  names(df) <- make.unique(names(df))
+  df$Dataset <- dataset_label
+  df
+}
+
+evi_rvs <- read_abricate(file.path(base_dir, "COMBINED_EVI_RVS.xlsx"), "EVI_RVS")
+evi_cat <- read_abricate(file.path(base_dir, "COMBINED_EVI_CAT.xlsx"), "EVI_CAT")
+asc_rvs <- read_abricate(file.path(base_dir, "COMBINED_ASC_RVS.xlsx"), "ASC_RVS")
+asc_cat <- read_abricate(file.path(base_dir, "COMBINED_ASC_CAT.xlsx"), "ASC_CAT")
+
+all_data <- bind_rows(evi_rvs, evi_cat, asc_rvs, asc_cat) %>%
+  mutate(RESISTANCE = str_to_lower(RESISTANCE))
+
+cat("Total gene-dataset rows:", nrow(all_data), "\n")
+cat("Unique genes across all datasets:", n_distinct(all_data$GENE), "\n")
+
+# Report databases present if that column exists
+if ("DATABASE" %in% names(all_data)) {
+  cat("Databases present:", paste(sort(unique(all_data$DATABASE)), collapse = ", "), "\n")
+}
+```
+
+---
+
+## 3. Normalise Gene Names
+
+The COMBINED Excel files are pre-aggregated summaries across all 7 ABRicate
+databases. Each row gives a gene name, the samples it was detected in, and a
+RESISTANCE annotation. Because these files are already summarised (not
+read-level), **filtering to a single database would discard the majority of
+detections and leave too few genes for clustering**.
+
+Instead, deduplication is handled at the matrix-building stage (Section 4):
+after gene-name normalisation, `distinct(GENE, Samples)` ensures the same gene
+is counted only once per sample, even if it appeared in multiple databases.
+
+Gene-name normalisation collapses allele variant suffixes so that, e.g.,
+`blaTEM-1b_1` and `blaTEM-1b_2` are treated as the same gene (`blatem-1b`).
+
+```{r normalise-genes}
+normalise_gene <- function(x) {
+  str_to_lower(x) %>%
+    str_remove("_[0-9]+$") %>%
+    str_trim()
+}
+
+evi_rvs <- evi_rvs %>% mutate(GENE = normalise_gene(GENE))
+evi_cat <- evi_cat %>% mutate(GENE = normalise_gene(GENE))
+asc_rvs <- asc_rvs %>% mutate(GENE = normalise_gene(GENE))
+asc_cat <- asc_cat %>% mutate(GENE = normalise_gene(GENE))
+
+cat("EVI_RVS genes after normalisation:", n_distinct(evi_rvs$GENE), "\n")
+cat("EVI_CAT genes after normalisation:", n_distinct(evi_cat$GENE), "\n")
+cat("ASC_RVS genes after normalisation:", n_distinct(asc_rvs$GENE), "\n")
+cat("ASC_CAT genes after normalisation:", n_distinct(asc_cat$GENE), "\n")
+```
+
+---
+
+## 4. Build Presence/Absence Matrices
+
+```{r presence-absence-function}
+# distinct(GENE, Samples) after normalisation ensures allele variants collapsed
+# above don't create duplicate rows in the matrix.
+build_presence_matrix <- function(df) {
+  df %>%
+    select(GENE, Samples) %>%
+    mutate(Samples = str_split(Samples, ",\\s*")) %>%
+    unnest(Samples) %>%
+    mutate(Samples = str_trim(Samples)) %>%
+    filter(Samples != "", !is.na(Samples)) %>%
+    distinct(GENE, Samples) %>%
+    mutate(present = 1L) %>%
+    pivot_wider(names_from = Samples, values_from = present, values_fill = 0L) %>%
+    column_to_rownames("GENE") %>%
+    as.matrix()
+}
+
+mat_evi_rvs <- build_presence_matrix(evi_rvs)
+mat_evi_cat <- build_presence_matrix(evi_cat)
+mat_asc_rvs <- build_presence_matrix(asc_rvs)
+mat_asc_cat <- build_presence_matrix(asc_cat)
+
+cat("EVI RVS matrix:", nrow(mat_evi_rvs), "genes ×", ncol(mat_evi_rvs), "samples\n")
+cat("EVI CAT matrix:", nrow(mat_evi_cat), "genes ×", ncol(mat_evi_cat), "samples\n")
+cat("ASC RVS matrix:", nrow(mat_asc_rvs), "genes ×", ncol(mat_asc_rvs), "samples\n")
+cat("ASC CAT matrix:", nrow(mat_asc_cat), "genes ×", ncol(mat_asc_cat), "samples\n")
+```
+
+---
+
+## 5. Calculate Co-occurrence (Jaccard Similarity)
+
+```{r jaccard-function}
+jaccard_matrix <- function(mat) {
+  n    <- nrow(mat)
+  genes <- rownames(mat)
+  jac  <- matrix(0, nrow = n, ncol = n, dimnames = list(genes, genes))
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      a <- mat[i, ]; b <- mat[j, ]
+      inter <- sum(a == 1 & b == 1)
+      uni   <- sum(a == 1 | b == 1)
+      jac[i, j] <- if (uni == 0) 0 else inter / uni
+    }
+  }
+  jac
+}
+
+jac_evi_rvs <- jaccard_matrix(mat_evi_rvs)
+jac_evi_cat <- jaccard_matrix(mat_evi_cat)
+jac_asc_rvs <- jaccard_matrix(mat_asc_rvs)
+jac_asc_cat <- jaccard_matrix(mat_asc_cat)
+```
+
+---
+
+## 6. Co-occurrence Heatmaps
+
+```{r heatmap-function}
+make_gene_annotation <- function(df) {
+  df %>%
+    select(GENE, RESISTANCE) %>%
+    filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+    mutate(RESISTANCE_CLASS = str_to_lower(str_extract(RESISTANCE, "^[^;]+"))) %>%
+    group_by(GENE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(GENE, RESISTANCE_CLASS) %>%
+    column_to_rownames("GENE")
+}
+
+ann_evi_rvs <- make_gene_annotation(evi_rvs)
+ann_evi_cat <- make_gene_annotation(evi_cat)
+ann_asc_rvs <- make_gene_annotation(asc_rvs)
+ann_asc_cat <- make_gene_annotation(asc_cat)
+
+heatmap_colors <- colorRampPalette(c("#FFFFFF", "#FFF3CD", "#FF9B00", "#D62728"))(100)
+
+plot_cooccurrence <- function(jac_mat, ann_df, title, max_genes = 60,
+                               show_names = TRUE, save_name = NULL) {
+  if (nrow(jac_mat) > max_genes) {
+    top_genes <- names(sort(rowMeans(jac_mat), decreasing = TRUE)[seq_len(max_genes)])
+    jac_mat   <- jac_mat[top_genes, top_genes]
+    ann_df    <- ann_df[rownames(ann_df) %in% top_genes, , drop = FALSE]
+    title     <- paste0(title, "\n(top ", max_genes, " genes by mean co-occurrence)")
+  }
+  ann_plot <- ann_df[rownames(jac_mat), , drop = FALSE]
+
+  # Scale font sizes for number display
+  n        <- nrow(jac_mat)
+  fnt_cell <- if (n > 40) 4 else if (n > 20) 6 else 7
+  fnt_lab  <- if (n > 40) 5.5 else 7
+
+  p <- pheatmap(
+    jac_mat,
+    color                    = heatmap_colors,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method        = "ward.D2",
+    annotation_row           = ann_plot,
+    annotation_col           = ann_plot,
+    display_numbers          = matrix(sprintf("%.2f", round(jac_mat, 2)),
+                                      nrow = nrow(jac_mat)),
+    number_color             = "black",
+    fontsize_number          = fnt_cell,
+    show_rownames            = show_names,
+    show_colnames            = show_names,
+    fontsize_row             = fnt_lab,
+    fontsize_col             = fnt_lab,
+    main                     = title,
+    border_color             = "grey80",
+    legend_breaks            = c(0, 0.25, 0.5, 0.75, 1),
+    legend_labels            = c("0.00", "0.25", "0.50", "0.75", "1.00"),
+    breaks                   = seq(0, 1, length.out = 101),
+    silent                   = TRUE
+  )
+
+  # Widen output for gene labels + annotation sidebar
+  w <- max(11, min(20, n * 0.35 + 6))
+  h <- max(9,  min(18, n * 0.35 + 4))
+
+  if (!is.null(save_name)) {
+    ggsave(file.path(plot_dir, paste0(save_name, ".png")),
+           plot = p$gtable, width = w, height = h, dpi = 300)
+    ggsave(file.path(plot_dir, paste0(save_name, ".pdf")),
+           plot = p$gtable, width = w, height = h)
+  }
+  print(p)
+}
+```
+
+### 6.1 Post Evisceration – RVS Broth Enriched
+
+```{r heatmap-evi-rvs}
+plot_cooccurrence(jac_evi_rvs, ann_evi_rvs,
+                  "Gene Co-occurrence – Post Evisceration, RVS Broth Enriched",
+                  save_name = "gene_cooc_EVI_RVS")
+```
+
+### 6.2 Post Evisceration – Bolton Broth + CAT Enriched
+
+```{r heatmap-evi-cat}
+plot_cooccurrence(jac_evi_cat, ann_evi_cat,
+                  "Gene Co-occurrence – Post Evisceration, Bolton Broth + CAT Enriched",
+                  save_name = "gene_cooc_EVI_CAT")
+```
+
+### 6.3 Post ASC Wash – RVS Broth Enriched
+
+```{r heatmap-asc-rvs}
+plot_cooccurrence(jac_asc_rvs, ann_asc_rvs,
+                  "Gene Co-occurrence – Post ASC Wash, RVS Broth Enriched",
+                  save_name = "gene_cooc_ASC_RVS")
+```
+
+### 6.4 Post ASC Wash – Bolton Broth + CAT Enriched
+
+```{r heatmap-asc-cat}
+plot_cooccurrence(jac_asc_cat, ann_asc_cat,
+                  "Gene Co-occurrence – Post ASC Wash, Bolton Broth + CAT Enriched",
+                  save_name = "gene_cooc_ASC_CAT")
+```
+
+---
+
+## 7. Cross-dataset Co-occurrence (EVI vs ASC, shared genes)
+
+```{r shared-genes}
+shared_rvs <- intersect(rownames(mat_evi_rvs), rownames(mat_asc_rvs))
+shared_cat <- intersect(rownames(mat_evi_cat), rownames(mat_asc_cat))
+cat("Shared genes – RVS broth:", length(shared_rvs), "\n")
+cat("Shared genes – CAT broth:", length(shared_cat), "\n")
+```
+
+```{r combined-rvs, fig.height=10, fig.width=12}
+if (length(shared_rvs) >= 3) {
+  rvs_combined     <- cbind(mat_evi_rvs[shared_rvs, ], mat_asc_rvs[shared_rvs, ])
+  jac_rvs_combined <- jaccard_matrix(rvs_combined)
+  gene_ann_rvs     <- make_gene_annotation(bind_rows(evi_rvs, asc_rvs))
+  gene_ann_rvs     <- gene_ann_rvs[rownames(gene_ann_rvs) %in% shared_rvs, , drop = FALSE]
+
+  p <- pheatmap(
+    jac_rvs_combined,
+    color            = heatmap_colors,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method        = "ward.D2",
+    annotation_row   = gene_ann_rvs[rownames(jac_rvs_combined), , drop = FALSE],
+    show_rownames    = TRUE, show_colnames    = TRUE,
+    fontsize_row     = if (nrow(jac_rvs_combined) > 40) 5.5 else 7,
+    fontsize_col     = if (ncol(jac_rvs_combined) > 40) 5.5 else 7,
+    main             = "Co-occurrence – Shared RVS Broth Genes (EVI + ASC combined)",
+    border_color     = NA, breaks = seq(0, 1, length.out = 101),
+    silent           = TRUE
+  )
+  ggsave(file.path(plot_dir, "heatmap_shared_RVS.png"),
+         plot = p$gtable, width = 12, height = 10, dpi = 300)
+  ggsave(file.path(plot_dir, "heatmap_shared_RVS.pdf"),
+         plot = p$gtable, width = 12, height = 10)
+  print(p)
+}
+```
+
+```{r combined-cat, fig.height=10, fig.width=12}
+if (length(shared_cat) >= 3) {
+  cat_combined     <- cbind(mat_evi_cat[shared_cat, ], mat_asc_cat[shared_cat, ])
+  jac_cat_combined <- jaccard_matrix(cat_combined)
+  gene_ann_cat     <- make_gene_annotation(bind_rows(evi_cat, asc_cat))
+  gene_ann_cat     <- gene_ann_cat[rownames(gene_ann_cat) %in% shared_cat, , drop = FALSE]
+
+  p <- pheatmap(
+    jac_cat_combined,
+    color            = heatmap_colors,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method        = "ward.D2",
+    annotation_row   = gene_ann_cat[rownames(jac_cat_combined), , drop = FALSE],
+    show_rownames    = TRUE, show_colnames    = TRUE,
+    fontsize_row     = if (nrow(jac_cat_combined) > 40) 5.5 else 7,
+    fontsize_col     = if (ncol(jac_cat_combined) > 40) 5.5 else 7,
+    main             = "Co-occurrence – Shared CAT Broth Genes (EVI + ASC combined)",
+    border_color     = NA, breaks = seq(0, 1, length.out = 101),
+    silent           = TRUE
+  )
+  ggsave(file.path(plot_dir, "heatmap_shared_CAT.png"),
+         plot = p$gtable, width = 12, height = 10, dpi = 300)
+  ggsave(file.path(plot_dir, "heatmap_shared_CAT.pdf"),
+         plot = p$gtable, width = 12, height = 10)
+  print(p)
+}
+```
+
+---
+
+## 8. Top Co-occurring Gene Pairs
+
+```{r top-pairs-function}
+top_pairs <- function(jac_mat, dataset_label, threshold = 0.75) {
+  melt(jac_mat, varnames = c("Gene1", "Gene2"), value.name = "Jaccard") %>%
+    filter(as.character(Gene1) < as.character(Gene2), Jaccard >= threshold) %>%
+    arrange(desc(Jaccard)) %>%
+    mutate(Dataset = dataset_labels[dataset_label]) %>%
+    select(Dataset, Gene1, Gene2, Jaccard)
+}
+
+pairs_all <- bind_rows(
+  top_pairs(jac_evi_rvs, "EVI_RVS"),
+  top_pairs(jac_evi_cat, "EVI_CAT"),
+  top_pairs(jac_asc_rvs, "ASC_RVS"),
+  top_pairs(jac_asc_cat, "ASC_CAT")
+)
+
+if (nrow(pairs_all) > 0) {
+  knitr::kable(pairs_all, digits = 3,
+               caption = "Gene pairs with Jaccard co-occurrence ≥ 0.75")
+} else {
+  cat("No gene pairs exceed 0.75. Showing top 20:\n")
+  bind_rows(
+    top_pairs(jac_evi_rvs, "EVI_RVS", 0), top_pairs(jac_evi_cat, "EVI_CAT", 0),
+    top_pairs(jac_asc_rvs, "ASC_RVS", 0), top_pairs(jac_asc_cat, "ASC_CAT", 0)
+  ) %>% arrange(desc(Jaccard)) %>% slice_head(n = 20) %>%
+    knitr::kable(digits = 3, caption = "Top 20 gene pairs by co-occurrence")
+}
+```
+
+---
+
+## 9. Resistance Class Co-occurrence
+
+```{r class-cooccurrence-function}
+class_cooccurrence <- function(pres_mat, df) {
+  gene_class <- df %>%
+    select(GENE, RESISTANCE) %>%
+    distinct(GENE, .keep_all = TRUE) %>%
+    mutate(RESISTANCE_CLASS = str_to_lower(str_extract(RESISTANCE, "^[^;]+"))) %>%
+    filter(!is.na(RESISTANCE_CLASS), RESISTANCE_CLASS != "na",
+           GENE %in% rownames(pres_mat))
+
+  classes <- unique(gene_class$RESISTANCE_CLASS)
+  samples <- colnames(pres_mat)
+
+  class_mat <- sapply(classes, function(cls) {
+    g <- gene_class$GENE[gene_class$RESISTANCE_CLASS == cls]
+    g <- g[g %in% rownames(pres_mat)]
+    if (!length(g)) return(rep(0L, length(samples)))
+    apply(pres_mat[g, , drop = FALSE], 2, function(x) as.integer(any(x == 1)))
+  })
+  rownames(class_mat) <- samples
+  t(class_mat) %*% class_mat
+}
+
+plot_class_cooc <- function(cooc_mat, title, save_name = NULL) {
+  n <- nrow(cooc_mat)
+  jac_class <- matrix(0, n, n, dimnames = dimnames(cooc_mat))
+  for (i in seq_len(n)) for (j in seq_len(n)) {
+    u <- cooc_mat[i,i] + cooc_mat[j,j] - cooc_mat[i,j]
+    jac_class[i,j] <- if (u == 0) 0 else cooc_mat[i,j] / u
+  }
+
+  p <- pheatmap(
+    jac_class,
+    color            = heatmap_colors,
+    clustering_method = "ward.D2",
+    display_numbers  = round(jac_class, 2),
+    number_color     = "black",
+    fontsize_number  = 7,
+    main             = title,
+    border_color     = "grey80",
+    breaks           = seq(0, 1, length.out = 101),
+    silent           = TRUE
+  )
+  if (!is.null(save_name)) {
+    ggsave(file.path(plot_dir, paste0(save_name, ".png")),
+           plot = p$gtable, width = 10, height = 8, dpi = 300)
+    ggsave(file.path(plot_dir, paste0(save_name, ".pdf")),
+           plot = p$gtable, width = 10, height = 8)
+  }
+  print(p)
+}
+```
+
+### 9.1 Post Evisceration – RVS Broth Enriched
+
+```{r class-evi-rvs, fig.height=8, fig.width=10}
+cooc_evi_rvs <- class_cooccurrence(mat_evi_rvs, evi_rvs)
+plot_class_cooc(cooc_evi_rvs,
+                "Resistance Class Co-occurrence – Post Evisceration, RVS Broth Enriched",
+                save_name = "class_cooc_EVI_RVS")
+```
+
+### 9.2 Post Evisceration – Bolton Broth + CAT Enriched
+
+```{r class-evi-cat, fig.height=8, fig.width=10}
+cooc_evi_cat <- class_cooccurrence(mat_evi_cat, evi_cat)
+plot_class_cooc(cooc_evi_cat,
+                "Resistance Class Co-occurrence – Post Evisceration, Bolton Broth + CAT Enriched",
+                save_name = "class_cooc_EVI_CAT")
+```
+
+### 9.3 Post ASC Wash – RVS Broth Enriched
+
+```{r class-asc-rvs, fig.height=8, fig.width=10}
+cooc_asc_rvs <- class_cooccurrence(mat_asc_rvs, asc_rvs)
+plot_class_cooc(cooc_asc_rvs,
+                "Resistance Class Co-occurrence – Post ASC Wash, RVS Broth Enriched",
+                save_name = "class_cooc_ASC_RVS")
+```
+
+### 9.4 Post ASC Wash – Bolton Broth + CAT Enriched
+
+```{r class-asc-cat, fig.height=8, fig.width=10}
+cooc_asc_cat <- class_cooccurrence(mat_asc_cat, asc_cat)
+plot_class_cooc(cooc_asc_cat,
+                "Resistance Class Co-occurrence – Post ASC Wash, Bolton Broth + CAT Enriched",
+                save_name = "class_cooc_ASC_CAT")
+```
+
+---
+
+## 10. Co-occurrence Network Graphs
+
+Resistance genes are shown as nodes, sized by **number of detections** (the
+number of samples a gene was found in) and coloured by resistance class.
+Edges connect gene pairs that co-occur; edge style reflects Jaccard distance (JD = 1 − Jaccard similarity):
+
+- **Thick solid** — JD < 0.15 (strong co-occurrence)
+- **Thin solid**  — JD 0.15–0.30 (moderate co-occurrence)
+- **Dashed**      — JD 0.30–0.50 (weak co-occurrence; only shown when `jd_display_max` > 0.30)
+
+Genes are clustered by the Louvain community detection algorithm.
+Edges with JD ≥ `jd_display_max` (default 0.30) are hidden to reduce clutter.
+Stress layout (graphlayouts) is used in place of FR for better node separation.
+
+```{r network-setup}
+# ── Resistance class colour palette ──────────────────────────────────────────
+# Classes are mapped to canonical names; synonyms from ABRicate databases are
+# collapsed so the legend never contains duplicate-colour entries or NA.
+res_class_pal <- c(
+  "beta-lactam"          = "#5B7FBF",
+  "cephalosporin"        = "#5B7FBF",
+  "penam"                = "#5B7FBF",
+  "carbapenem"           = "#3A5FA0",
+  "tetracycline"         = "#3A9E4D",
+  "aminoglycoside"       = "#B0B0B0",
+  "quinolone"            = "#1F3A7A",
+  "fluoroquinolone"      = "#1F3A7A",
+  "macrolide"            = "#8DB4E2",
+  "phenicol"             = "#404040",
+  "lincosamide"          = "#E8A0C8",
+  "streptogramin"        = "#D46FA0",
+  "sulphonamide"         = "#5BC8D2",
+  "sulfonamide"          = "#5BC8D2",
+  "trimethoprim"         = "#1B6B2A",
+  "glycopeptide"         = "#6B3FA0",
+  "oxazolidinone"        = "#A07850",
+  "pleuromutilin"        = "#E0B040",
+  "rifamycin"            = "#B05030",
+  "fosfomycin"           = "#E060C0",
+  "fusidic acid"         = "#D08050",
+  "fusidic_acid"         = "#D08050",
+  "disinfectant/biocide" = "#505050",
+  "disinfectant"         = "#505050",
+  "multidrug efflux"     = "#909090",
+  "multidrug"            = "#909090",
+  "efflux"               = "#909090",
+  "other"                = "#D0D0D0"
+)
+
+# Canonical display names for the legend (deduplicated palette)
+res_class_pal_display <- c(
+  "beta-lactam"          = "#5B7FBF",
+  "tetracycline"         = "#3A9E4D",
+  "aminoglycoside"       = "#B0B0B0",
+  "quinolone"            = "#1F3A7A",
+  "macrolide"            = "#8DB4E2",
+  "phenicol"             = "#404040",
+  "lincosamide"          = "#E8A0C8",
+  "streptogramin"        = "#D46FA0",
+  "sulphonamide"         = "#5BC8D2",
+  "trimethoprim"         = "#1B6B2A",
+  "glycopeptide"         = "#6B3FA0",
+  "oxazolidinone"        = "#A07850",
+  "pleuromutilin"        = "#E0B040",
+  "rifamycin"            = "#B05030",
+  "fosfomycin"           = "#E060C0",
+  "fusidic acid"         = "#D08050",
+  "disinfectant/biocide" = "#505050",
+  "multidrug efflux"     = "#909090",
+  "other"                = "#D0D0D0"
+)
+
+# ── Build network from Jaccard matrix + gene metadata ────────────────────────
+# jd_max: edges with JD ≥ jd_max excluded from graph (affects Louvain clustering)
+build_gene_network <- function(jac_mat, df, jd_max = 0.4, max_clusters = 6) {
+
+  nodes <- df %>%
+    select(GENE, RESISTANCE, Count) %>%
+    distinct(GENE, .keep_all = TRUE) %>%
+    filter(GENE %in% rownames(jac_mat)) %>%
+    mutate(
+      res_class = str_to_lower(str_extract(RESISTANCE, "^[^;]+")) %>% str_trim(),
+      res_class = if_else(is.na(res_class) | !res_class %in% names(res_class_pal),
+                          "other", res_class),
+      count_n   = as.integer(Count)
+    ) %>%
+    rename(name = GENE)
+
+  jac_sub <- jac_mat[nodes$name, nodes$name]
+
+  edges <- melt(jac_sub, varnames = c("from", "to"), value.name = "jaccard") %>%
+    filter(as.character(from) < as.character(to)) %>%
+    mutate(jd = 1 - jaccard) %>%
+    filter(jd > 0, jd < jd_max) %>%
+    mutate(edge_type = case_when(
+      jd < 0.15 ~ "strong",
+      jd < 0.30 ~ "moderate",
+      TRUE      ~ "weak"
+    ))
+
+  if (nrow(edges) == 0) return(NULL)
+
+  g    <- graph_from_data_frame(edges, directed = FALSE, vertices = nodes)
+  comm <- cluster_louvain(g, weights = E(g)$jaccard)
+  memb <- membership(comm)
+  sizes <- table(memb)
+
+  multi     <- names(sizes)[sizes > 1]
+  size_rank <- rank(-sizes[multi], ties.method = "first")
+
+  V(g)$cluster_label <- sapply(as.character(memb), function(m) {
+    if (!m %in% multi) return("Isolated genes")
+    r <- size_rank[m]
+    if (r <= max_clusters) paste("Cluster", r) else "Isolated genes"
+  })
+
+  as_tbl_graph(g)
+}
+
+# ── Plot one cluster subgraph ─────────────────────────────────────────────────
+.plot_cluster <- function(g_ig, node_df, cl, count_range,
+                           jd_display_max, with_legend) {
+
+  idx   <- which(node_df$cluster_label == cl)
+  g_sub <- igraph::induced_subgraph(g_ig, idx)
+
+  bad_e <- which(igraph::edge_attr(g_sub, "jd") >= jd_display_max)
+  if (length(bad_e)) g_sub <- igraph::delete_edges(g_sub, bad_e)
+
+  n_nodes <- igraph::vcount(g_sub)
+  n_edges <- igraph::ecount(g_sub)
+
+  # Layout: stress (graphlayouts) for connected clusters — better separation
+  # than Fruchterman-Reingold; manual grid for no-edge panels.
+  if (n_edges == 0) {
+    nc  <- max(1, ceiling(sqrt(n_nodes)))
+    x_g <- ((seq_len(n_nodes) - 1) %% nc) * 1.5
+    y_g <- -((seq_len(n_nodes) - 1) %/% nc) * 1.5
+    p_base <- ggraph(as_tbl_graph(g_sub), layout = "manual", x = x_g, y = y_g)
+  } else {
+    set.seed(42)
+    p_base <- ggraph(as_tbl_graph(g_sub), layout = "stress")
+  }
+
+  # Adaptive label threshold: in dense panels only label genes detected in ≥2 samples
+  v_df            <- igraph::as_data_frame(g_sub, what = "vertices")
+  label_threshold <- if (n_nodes > 15) 2L else 1L
+
+  # Colours limited to classes actually present in this subgraph (clean legend)
+  classes_here <- unique(v_df$res_class)
+  pal_here     <- res_class_pal_display[names(res_class_pal_display) %in% classes_here]
+
+  p <- p_base +
+    geom_node_point(
+      aes(size = count_n, fill = res_class),
+      shape = 21, colour = "white", stroke = 0.6
+    ) +
+    scale_size_continuous(
+      name   = "No. of\ndetections",
+      range  = c(3, 14),
+      breaks = unique(round(seq(count_range[1], count_range[2], length.out = 4))),
+      limits = count_range
+    ) +
+    scale_fill_manual(
+      values       = res_class_pal,
+      name         = "Resistance class",
+      breaks       = names(pal_here),   # only classes present → no NA row
+      labels       = names(pal_here),
+      na.value     = "#C8C8C8",
+      na.translate = FALSE
+    ) +
+    geom_node_text(
+      aes(label = if_else(count_n >= label_threshold, name, "")),
+      repel              = TRUE,
+      size               = 2.5,
+      fontface           = "italic",
+      colour             = "grey10",
+      max.overlaps       = 30,
+      box.padding        = 0.4,
+      point.padding      = 0.3,
+      force              = 5,
+      force_pull         = 0.8,
+      min.segment.length = 0.1,
+      segment.size       = 0.25,
+      segment.color      = "grey50",
+      segment.alpha      = 0.7
+    ) +
+    labs(title = cl) +
+    theme_graph(base_size = 10) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 11, hjust = 0.5,
+                                     margin = margin(b = 4)),
+      legend.position = if (with_legend) "right" else "none",
+      legend.box      = "vertical",
+      legend.key.size = unit(0.45, "cm"),
+      legend.text     = element_text(size = 8),
+      legend.title    = element_text(size = 8.5, face = "bold"),
+      plot.margin     = margin(8, 8, 8, 8)
+    )
+
+  if (n_edges > 0) {
+    p <- p +
+      geom_edge_link(
+        aes(edge_width = edge_type, edge_linetype = edge_type,
+            edge_alpha  = edge_type),
+        colour = "grey25"
+      ) +
+      scale_edge_width_manual(
+        name   = "Co-occurrence\n(Jaccard distance)",
+        values = c("strong" = 1.8, "moderate" = 0.8, "weak" = 0.35),
+        labels = c("strong" = "JD < 0.15", "moderate" = "JD 0.15–0.30",
+                   "weak"   = "JD 0.30–0.50"),
+        limits = c("strong", "moderate", "weak"), drop = FALSE
+      ) +
+      scale_edge_linetype_manual(
+        name   = "Co-occurrence\n(Jaccard distance)",
+        values = c("strong" = "solid", "moderate" = "solid", "weak" = "dashed"),
+        labels = c("strong" = "JD < 0.15", "moderate" = "JD 0.15–0.30",
+                   "weak"   = "JD 0.30–0.50"),
+        limits = c("strong", "moderate", "weak"), drop = FALSE
+      ) +
+      scale_edge_alpha_manual(
+        values = c("strong" = 0.90, "moderate" = 0.60, "weak" = 0.30),
+        guide  = "none"
+      )
+  }
+  p
+}
+
+# ── Main plot function (patchwork of per-cluster panels) ──────────────────────
+plot_gene_network <- function(tg, title, save_name = NULL,
+                               jd_display_max = 0.30,
+                               max_clusters   = 6,
+                               width = 22, height = 16) {
+  if (is.null(tg)) {
+    message("No edges: ", title); return(invisible(NULL))
+  }
+
+  g_ig    <- as.igraph(tg)
+  node_df <- igraph::as_data_frame(g_ig, what = "vertices")
+
+  named_cls <- sort(unique(node_df$cluster_label[node_df$cluster_label != "Isolated genes"]))
+  has_iso   <- "Isolated genes" %in% node_df$cluster_label
+  all_cls   <- c(named_cls, if (has_iso) "Isolated genes")
+
+  count_range <- range(node_df$count_n, na.rm = TRUE)
+
+  panels <- lapply(seq_along(all_cls), function(i) {
+    .plot_cluster(g_ig, node_df, all_cls[i], count_range,
+                  jd_display_max,
+                  with_legend = (i == length(named_cls)))
+  })
+
+  # Column count: 2 for ≤2 named clusters, 3 for more
+  ncols <- if (length(named_cls) <= 2) 2L else 3L
+
+  p_out <- wrap_plots(panels, ncol = ncols, guides = "collect") +
+    plot_annotation(
+      title   = title,
+      caption = paste0(
+        "Nodes sized by number of sample detections; coloured by resistance class.  ",
+        "Edges shown where Jaccard distance < ", jd_display_max,
+        " (thick solid: JD < 0.15; thin solid: JD 0.15–0.30; dashed: JD 0.30–0.50).  ",
+        "Louvain community detection; singletons grouped as 'Isolated genes'."
+      ),
+      theme = theme(
+        plot.title   = element_text(face = "bold", size = 14, margin = margin(b = 6)),
+        plot.caption = element_text(size = 7, colour = "grey45", hjust = 0,
+                                    margin = margin(t = 6))
+      )
+    )
+
+  if (!is.null(save_name)) {
+    ggsave(file.path(plot_dir, paste0(save_name, ".png")),
+           plot = p_out, width = width, height = height, dpi = 300)
+    ggsave(file.path(plot_dir, paste0(save_name, ".pdf")),
+           plot = p_out, width = width, height = height)
+  }
+  p_out
+}
+```
+
+### 9.1 Post Evisceration – RVS Broth Enriched
+
+```{r network-evi-rvs, fig.width=22, fig.height=16}
+net_evi_rvs <- build_gene_network(jac_evi_rvs, evi_rvs)
+plot_gene_network(net_evi_rvs,
+                  "AMR Gene Co-occurrence Network – Post Evisceration, RVS Broth Enriched",
+                  save_name = "network_EVI_RVS")
+```
+
+### 9.2 Post Evisceration – Bolton Broth + CAT Enriched
+
+```{r network-evi-cat, fig.width=22, fig.height=16}
+net_evi_cat <- build_gene_network(jac_evi_cat, evi_cat)
+plot_gene_network(net_evi_cat,
+                  "AMR Gene Co-occurrence Network – Post Evisceration, Bolton Broth + CAT Enriched",
+                  save_name = "network_EVI_CAT")
+```
+
+### 9.3 Post ASC Wash – RVS Broth Enriched
+
+```{r network-asc-rvs, fig.width=22, fig.height=16}
+net_asc_rvs <- build_gene_network(jac_asc_rvs, asc_rvs)
+plot_gene_network(net_asc_rvs,
+                  "AMR Gene Co-occurrence Network – Post ASC Wash, RVS Broth Enriched",
+                  save_name = "network_ASC_RVS")
+```
+
+### 9.4 Post ASC Wash – Bolton Broth + CAT Enriched
+
+```{r network-asc-cat, fig.width=22, fig.height=16}
+net_asc_cat <- build_gene_network(jac_asc_cat, asc_cat)
+plot_gene_network(net_asc_cat,
+                  "AMR Gene Co-occurrence Network – Post ASC Wash, Bolton Broth + CAT Enriched",
+                  save_name = "network_ASC_CAT")
+```
+
+---
+
+## 11. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,822 @@
+---
+title: "Read Tracking Across Processing Steps"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+dir.create("figures", showWarnings = FALSE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(scales)
+```
+
+## Overview
+
+Reads were tracked across three processing stages:
+
+1. **Raw** — reads as sequenced
+2. **Post-QC** — after adapter trimming (Porechop) and quality/length filtering (NanoFilt)
+3. **Post-host depletion** — after bioinformatic removal of host (chicken) DNA
+
+---
+
+## Data
+
+```{r data}
+# QC data (raw → post-QC) from table across all sample types
+qc_data <- tribble(
+  ~sample_type,                    ~replicate, ~raw_reads, ~post_qc_reads,
+  "Post-ASC",                      "CH01",      562337,     391752,
+  "Post-ASC",                      "CH02",     1080072,     849899,
+  "Post-ASC",                      "CH03",      98895,      69014,
+  "Post-ASC",                      "CH04",      4532,       2960,
+  "Post-ASC",                      "CH05",     1345828,    1073510,
+  "Post-ASC",                      "CH06",      70431,      42563,
+  "Post-ASC BF Bolton base + CAT", "CH01",     1780424,    1321890,
+  "Post-ASC BF Bolton base + CAT", "CH02",     5385771,    4163882,
+  "Post-ASC BF Bolton base + CAT", "CH03",     4136393,    3109141,
+  "Post-ASC BF Bolton base + CAT", "CH04",      71146,      61211,
+  "Post-ASC BF Bolton base + CAT", "CH05",     5234812,    4353808,
+  "Post-ASC BF Bolton base + CAT", "CH06",     1281858,    1012131,
+  "Post-ASC BPW then RVS",            "CH01",     6452280,    4877878,
+  "Post-ASC BPW then RVS",            "CH02",     4380026,    2805742,
+  "Post-ASC BPW then RVS",            "CH03",      28402,      20713,
+  "Post-ASC BPW then RVS",            "CH04",      90856,      54875,
+  "Post-ASC BPW then RVS",            "CH05",     3149323,    2281601,
+  "Post-ASC BPW then RVS",            "CH06",     2833572,    2010907,
+  "Post-EVI",                      "CH01",      868926,     624396,
+  "Post-EVI",                      "CH02",      769659,     588592,
+  "Post-EVI",                      "CH03",      401658,     348438,
+  "Post-EVI",                      "CH04",      603448,     538739,
+  "Post-EVI",                      "CH05",      65099,      33611,
+  "Post-EVI",                      "CH06",      771002,     670622,
+  "Post-EVI BF Bolton base + CAT", "CH01",     3213560,    1894168,
+  "Post-EVI BF Bolton base + CAT", "CH02",     8046910,    5489116,
+  "Post-EVI BF Bolton base + CAT", "CH03",     4393790,    2798460,
+  "Post-EVI BF Bolton base + CAT", "CH04",     7064274,    4834243,
+  "Post-EVI BF Bolton base + CAT", "CH05",     2811819,    2038763,
+  "Post-EVI BF Bolton base + CAT", "CH06",     4965836,    3942476,
+  "Post-EVI BPW then RVS",            "CH01",     1655061,    1185896,
+  "Post-EVI BPW then RVS",            "CH02",     4352260,    3364055,
+  "Post-EVI BPW then RVS",            "CH03",     2657706,    1878954,
+  "Post-EVI BPW then RVS",            "CH04",     2285651,    1673254,
+  "Post-EVI BPW then RVS",            "CH05",     3487325,    2483961,
+  "Post-EVI BPW then RVS",            "CH06",     1570155,    1119562
+)
+
+# Fix the one typo in sample_type
+qc_data <- qc_data %>%
+  mutate(sample_type = str_replace(sample_type, "bpw", "BPW"))
+
+# Host-depletion data (post-QC → post-host depletion) from NanoPlot HTML reports
+host_data <- tribble(
+  ~sample_type,                    ~replicate, ~post_qc_reads, ~post_host_reads, ~pct_removed,
+  "Post-ASC",                      "CH01",      391752,          36119,           90.78,
+  "Post-ASC",                      "CH02",      849899,          32675,           96.16,
+  "Post-ASC",                      "CH03",       69014,           3716,           94.62,
+  "Post-ASC",                      "CH04",        2960,            157,           94.70,
+  "Post-ASC",                      "CH05",     1073510,          16688,           98.45,
+  "Post-ASC",                      "CH06",       42563,           2504,           94.12,
+  "Post-ASC BF Bolton base + CAT", "CH01",     1321890,        1013671,          23.32,
+  "Post-ASC BF Bolton base + CAT", "CH02",     4163882,        2104950,          49.45,
+  "Post-ASC BF Bolton base + CAT", "CH03",     3109141,        2565216,          17.49,
+  "Post-ASC BF Bolton base + CAT", "CH04",      61211,          14214,           76.78,
+  "Post-ASC BF Bolton base + CAT", "CH05",     4353808,        3814604,          12.38,
+  "Post-ASC BF Bolton base + CAT", "CH06",     1012131,         766111,          24.31,
+  "Post-ASC BPW then RVS",            "CH01",     4877878,        4630234,           5.08,
+  "Post-ASC BPW then RVS",            "CH02",     2805742,        2626224,           6.40,
+  "Post-ASC BPW then RVS",            "CH03",      20713,           4294,           79.27,
+  "Post-ASC BPW then RVS",            "CH04",      54875,           6012,           89.04,
+  "Post-ASC BPW then RVS",            "CH05",     2281601,        2185023,           4.23,
+  "Post-ASC BPW then RVS",            "CH06",     2010907,        1847583,           8.12,
+  "Post-EVI",                      "CH01",      624396,          15381,           97.54,
+  "Post-EVI",                      "CH02",      588592,          15565,           97.36,
+  "Post-EVI",                      "CH03",      348438,           4162,           98.81,
+  "Post-EVI",                      "CH04",      538739,          11867,           97.80,
+  "Post-EVI",                      "CH05",       33611,            301,           99.10,
+  "Post-EVI",                      "CH06",      670622,          12092,           98.20,
+  "Post-EVI BF Bolton base + CAT", "CH01",     1894168,        1723406,           9.02,
+  "Post-EVI BF Bolton base + CAT", "CH02",     5489116,        5289232,           3.64,
+  "Post-EVI BF Bolton base + CAT", "CH03",     2798460,        2488681,          11.07,
+  "Post-EVI BF Bolton base + CAT", "CH04",     4834243,        4475906,           7.41,
+  "Post-EVI BF Bolton base + CAT", "CH05",     2038763,        1689198,          17.15,
+  "Post-EVI BF Bolton base + CAT", "CH06",     3942476,        3777871,           4.18,
+  "Post-EVI BPW then RVS",            "CH01",     1185896,        1043198,          12.03,
+  "Post-EVI BPW then RVS",            "CH02",     3364055,        3088263,           8.20,
+  "Post-EVI BPW then RVS",            "CH03",     1878954,        1601298,          14.78,
+  "Post-EVI BPW then RVS",            "CH04",     1673254,        1414998,          15.43,
+  "Post-EVI BPW then RVS",            "CH05",     2483961,        1941906,          21.82,
+  "Post-EVI BPW then RVS",            "CH06",     1119562,         952845,          14.89
+)
+
+# Merge all data
+full_data <- qc_data %>%
+  left_join(host_data %>% select(sample_type, replicate, post_host_reads, pct_removed),
+            by = c("sample_type", "replicate")) %>%
+  mutate(
+    pct_retained_qc    = round(post_qc_reads   / raw_reads     * 100, 1),
+    pct_retained_host  = round(post_host_reads / post_qc_reads * 100, 1),
+    pct_retained_total = round(post_host_reads / raw_reads     * 100, 1)
+  )
+```
+
+---
+
+## Read tracking tables
+
+### All sample types — QC step
+
+```{r table-qc}
+full_data %>%
+  select(sample_type, replicate, raw_reads, post_qc_reads, pct_retained_qc) %>%
+  mutate(
+    raw_reads     = comma(raw_reads),
+    post_qc_reads = comma(post_qc_reads),
+    pct_retained_qc = paste0(pct_retained_qc, "%")
+  ) %>%
+  rename(
+    `Sample type`       = sample_type,
+    `Replicate`         = replicate,
+    `Raw reads`         = raw_reads,
+    `Post-QC reads`     = post_qc_reads,
+    `% retained (QC)`   = pct_retained_qc
+  ) %>%
+  kable(align = c("l", "c", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  pack_rows("Post-ASC", 1, 6) %>%
+  pack_rows("Post-ASC BF Bolton base + CAT", 7, 12) %>%
+  pack_rows("Post-ASC BPW then RVS", 13, 18) %>%
+  pack_rows("Post-EVI", 19, 24) %>%
+  pack_rows("Post-EVI BF Bolton base + CAT", 25, 30) %>%
+  pack_rows("Post-EVI BPW then RVS", 31, 36)
+```
+
+### All samples — host-DNA depletion step
+
+```{r table-host}
+full_data %>%
+  select(sample_type, replicate, post_qc_reads, post_host_reads, pct_retained_host) %>%
+  mutate(
+    post_qc_reads     = comma(post_qc_reads),
+    post_host_reads   = comma(post_host_reads),
+    pct_retained_host = paste0(pct_retained_host, "%")
+  ) %>%
+  rename(
+    `Sample type`               = sample_type,
+    `Replicate`                 = replicate,
+    `Post-QC reads`             = post_qc_reads,
+    `Post-host depletion reads` = post_host_reads,
+    `% retained (host removal)` = pct_retained_host
+  ) %>%
+  kable(align = c("l", "c", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  pack_rows("Post-ASC", 1, 6) %>%
+  pack_rows("Post-ASC BF Bolton base + CAT", 7, 12) %>%
+  pack_rows("Post-ASC BPW then RVS", 13, 18) %>%
+  pack_rows("Post-EVI", 19, 24) %>%
+  pack_rows("Post-EVI BF Bolton base + CAT", 25, 30) %>%
+  pack_rows("Post-EVI BPW then RVS", 31, 36)
+```
+
+### All samples — full pipeline summary
+
+```{r table-full}
+full_data %>%
+  select(sample_type, replicate, raw_reads, post_qc_reads, post_host_reads, pct_retained_total) %>%
+  mutate(
+    raw_reads          = comma(raw_reads),
+    post_qc_reads      = comma(post_qc_reads),
+    post_host_reads    = comma(post_host_reads),
+    pct_retained_total = paste0(pct_retained_total, "%")
+  ) %>%
+  rename(
+    `Sample type`          = sample_type,
+    `Replicate`            = replicate,
+    `Raw reads`            = raw_reads,
+    `Post-QC`              = post_qc_reads,
+    `Post-host depletion`  = post_host_reads,
+    `% retained (overall)` = pct_retained_total
+  ) %>%
+  kable(align = c("l", "c", "r", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  pack_rows("Post-ASC", 1, 6) %>%
+  pack_rows("Post-ASC BF Bolton base + CAT", 7, 12) %>%
+  pack_rows("Post-ASC BPW then RVS", 13, 18) %>%
+  pack_rows("Post-EVI", 19, 24) %>%
+  pack_rows("Post-EVI BF Bolton base + CAT", 25, 30) %>%
+  pack_rows("Post-EVI BPW then RVS", 31, 36)
+```
+
+---
+
+## Visualisations
+
+### Read counts at each processing step
+
+```{r plot-tracking, fig.width=10, fig.height=9}
+# Facet order: col 1 = Post-ASC, col 2 = Post-EVI, rows = enrichment type
+facet_order <- c(
+  "Post-EVI",                      "Post-ASC",
+  "Post-EVI BF Bolton base + CAT", "Post-ASC BF Bolton base + CAT",
+  "Post-EVI BPW then RVS",            "Post-ASC BPW then RVS"
+)
+
+plot_data <- full_data %>%
+  select(sample_type, replicate, raw_reads, post_qc_reads, post_host_reads) %>%
+  pivot_longer(cols = c(raw_reads, post_qc_reads, post_host_reads),
+               names_to = "stage", values_to = "reads") %>%
+  mutate(
+    stage = factor(stage,
+                   levels = c("raw_reads", "post_qc_reads", "post_host_reads"),
+                   labels = c("Raw", "Post-QC", "Post-host\ndepletion")),
+    sample_type = factor(sample_type, levels = facet_order)
+  )
+
+p1 <- ggplot(plot_data, aes(x = stage, y = reads, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~sample_type, scales = "free_y", ncol = 2) +
+  scale_y_continuous(labels = label_comma()) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title = "Read count changes during bioinformatic processing steps",
+    subtitle = "1. Raw reads | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x      = "Processing stage",
+    y      = "Read count",
+    colour = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title            = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/read_tracking_counts.png", plot = p1,
+       width = 10, height = 9, units = "in", dpi = 600)
+
+p1
+```
+
+### Read counts at each processing step — fixed y-axis (raw scale)
+
+```{r plot-tracking-fixed, fig.width=10, fig.height=9}
+p1_fixed <- ggplot(plot_data, aes(x = stage, y = reads, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~sample_type, scales = "fixed", ncol = 2) +
+  scale_y_continuous(labels = label_comma(), breaks = pretty_breaks(n = 12)) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title = "Read count changes during bioinformatic processing steps (fixed y-axis)",
+    subtitle = "1. Raw reads | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x      = "Processing stage",
+    y      = "Read count",
+    colour = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/read_tracking_counts_fixed.png", plot = p1_fixed,
+       width = 10, height = 9, units = "in", dpi = 300)
+
+p1_fixed
+```
+
+### Read counts at each processing step — fixed log₁₀ y-axis
+
+```{r plot-tracking-log10, fig.width=10, fig.height=9}
+p1_log <- ggplot(plot_data, aes(x = stage, y = reads, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~sample_type, scales = "fixed", ncol = 2) +
+  scale_y_log10(labels = label_comma()) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title = "Read count changes during bioinformatic processing steps (log10 scale, fixed y-axis)",
+    subtitle = "1. Raw reads | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x      = "Processing stage",
+    y      = "Read count (log₁₀)",
+    colour = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/read_tracking_counts_log10.png", plot = p1_log,
+       width = 10, height = 9, units = "in", dpi = 600)
+
+p1_log
+```
+
+### Read counts at each processing step — row-shared y-axis (lower-read samples visible)
+
+```{r plot-tracking-row-scales, fig.width=10, fig.height=9}
+grid_data <- plot_data %>%
+  mutate(
+    processing = if_else(str_detect(sample_type, "EVI"), "Post-EVI", "Post-ASC"),
+    enrichment = case_when(
+      str_detect(sample_type, "BF Bolton") ~ "BF Bolton base + CAT",
+      str_detect(sample_type, "BPW")       ~ "BPW then RVS",
+      TRUE                                 ~ "No enrichment"
+    ),
+    enrichment = factor(enrichment,
+                        levels = c("No enrichment",
+                                   "BF Bolton base + CAT",
+                                   "BPW then RVS"))
+  )
+
+p1_grid <- ggplot(grid_data, aes(x = stage, y = reads, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_grid(enrichment ~ processing, scales = "free_y") +
+  scale_y_continuous(labels = label_comma(), breaks = pretty_breaks(n = 8)) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title    = "Read count changes during bioinformatic processing steps (row-shared y-axis)",
+    subtitle = "1. Raw reads | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x        = "Processing stage",
+    y        = "Read count",
+    colour   = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/read_tracking_counts_row_scales.png", plot = p1_grid,
+       width = 10, height = 9, units = "in", dpi = 600)
+
+p1_grid
+```
+
+### Heatmap of read counts across processing steps
+
+```{r plot-heatmap, fig.width=12, fig.height=10}
+heatmap_data <- full_data %>%
+  select(sample_type, replicate, raw_reads, post_qc_reads, post_host_reads) %>%
+  pivot_longer(cols = c(raw_reads, post_qc_reads, post_host_reads),
+               names_to = "stage", values_to = "reads") %>%
+  mutate(
+    stage = factor(stage,
+                   levels = c("raw_reads", "post_qc_reads", "post_host_reads"),
+                   labels = c("Raw", "Post-QC", "Post-host\ndepletion")),
+    sample_type = factor(sample_type, levels = facet_order),
+    replicate   = factor(replicate, levels = rev(paste0("CH0", 1:6)))
+  )
+
+p_heat <- ggplot(heatmap_data, aes(x = stage, y = replicate, fill = reads)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = comma(reads, accuracy = 1)), size = 2.4, colour = "black") +
+  facet_wrap(~sample_type, ncol = 2) +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       trans   = "log10",
+                       labels  = label_comma(),
+                       name    = "Read count\n(log₁₀ scale)") +
+  labs(
+    title = "Heatmap of read counts across bioinformatic processing steps",
+    x     = "Processing stage",
+    y     = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid       = element_blank(),
+    legend.position  = "right"
+  )
+
+ggsave("figures/read_tracking_heatmap.png", plot = p_heat,
+       width = 10, height = 8, units = "in", dpi = 300)
+
+p_heat
+```
+
+### Percentage of reads retained at each step
+
+```{r plot-pct, fig.width=10, fig.height=7}
+pct_data <- full_data %>%
+  select(sample_type, replicate, pct_retained_qc, pct_retained_host) %>%
+  pivot_longer(cols = c(pct_retained_qc, pct_retained_host),
+               names_to = "stage", values_to = "pct_retained") %>%
+  mutate(
+    stage = factor(stage,
+                   levels = c("pct_retained_qc", "pct_retained_host"),
+                   labels = c("QC filtering", "Host-DNA depletion"))
+  )
+
+p2 <- ggplot(pct_data, aes(x = replicate, y = pct_retained, fill = stage)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_hline(yintercept = c(50, 75), linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  facet_wrap(~sample_type, ncol = 2) +
+  scale_fill_manual(values = c("QC filtering" = "steelblue3", "Host-DNA depletion" = "coral3")) +
+  scale_y_continuous(limits = c(0, 105), labels = function(x) paste0(x, "%")) +
+  labs(
+    x    = "Replicate",
+    y    = "% reads retained",
+    fill = "Processing step"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+
+ggsave("figures/read_tracking_pct_retained.png", plot = p2,
+       width = 10, height = 7, units = "in", dpi = 300)
+
+p2
+```
+
+---
+
+## Summary statistics
+
+```{r summary-stats}
+full_data %>%
+  group_by(sample_type) %>%
+  summarise(
+    `Mean raw reads`            = comma(round(mean(raw_reads))),
+    `Mean post-QC reads`        = comma(round(mean(post_qc_reads))),
+    `Mean post-host reads`      = comma(round(mean(post_host_reads))),
+    `Mean % retained (QC)`      = paste0(round(mean(pct_retained_qc), 1), "%"),
+    `Mean % retained (host dep)`= paste0(round(mean(pct_retained_host), 1), "%"),
+    `Mean % retained (overall)` = paste0(round(mean(pct_retained_total), 1), "%"),
+    .groups = "drop"
+  ) %>%
+  rename(`Sample type` = sample_type) %>%
+  kable(align = c("l", rep("r", 6))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE)
+```
+
+---
+
+## Base tracking
+
+### Data
+
+```{r base-data}
+# Helper: parse "Total bases" from a NanoPlot HTML report
+extract_total_bases <- function(path) {
+  html <- readr::read_file(path)
+  m    <- regmatches(html, regexpr("Total bases</th>\\s*<td>([^<]+)</td>", html))
+  val  <- sub(".*<td>([^<]+)</td>", "\\1", m)
+  as.numeric(gsub(",", "", val))   # strip commas; trailing .0 handled by as.numeric
+}
+
+nanoplot_base <- "/Volumes/Alice/2_POULTRY_PROCESSING/Analysis/Nanoplot_poultry_processing"
+
+groups <- tribble(
+  ~sample_type,                    ~folder_prefix, ~file_prefix,
+  "Post-ASC",                      "ASC",          "ASC",
+  "Post-ASC BF Bolton base + CAT", "ASC_CAT",      "ASC_CAT",
+  "Post-ASC BPW then RVS",            "ASC_RVS",      "ASC_RVS",
+  "Post-EVI",                      "EVI",          "EVI",
+  "Post-EVI BF Bolton base + CAT", "EVI_CAT",      "EVI_CAT",
+  "Post-EVI BPW then RVS",            "EVI_RVS",      "EVI_RVS"
+)
+
+# Raw and post-QC bases from the _raw and _filtered NanoPlot reports
+base_qc <- crossing(groups, replicate = paste0("CH0", 1:6), stage = c("raw", "filtered")) %>%
+  mutate(
+    path  = file.path(nanoplot_base,
+                      paste0(folder_prefix, "_Nanoplot"),
+                      paste0("NanoPlot-report_", file_prefix, "_", replicate, "_", stage, ".html")),
+    bases = map_dbl(path, extract_total_bases),
+    col   = if_else(stage == "raw", "raw_bases", "post_qc_bases")
+  ) %>%
+  select(sample_type, replicate, col, bases) %>%
+  pivot_wider(names_from = col, values_from = bases)
+
+# Post-host-depletion bases from the host-dep NanoPlot reports
+base_host <- crossing(groups, replicate = paste0("CH0", 1:6)) %>%
+  mutate(
+    path            = file.path(nanoplot_base,
+                                paste0(folder_prefix, "_Host-dep_Nanoplot"),
+                                paste0(replicate, "_", file_prefix, "_host.html")),
+    post_host_bases = map_dbl(path, extract_total_bases)
+  ) %>%
+  select(sample_type, replicate, post_host_bases)
+
+base_full <- base_qc %>%
+  left_join(base_host, by = c("sample_type", "replicate")) %>%
+  mutate(
+    pct_retained_qc    = round(post_qc_bases   / raw_bases      * 100, 1),
+    pct_retained_host  = round(post_host_bases / post_qc_bases  * 100, 1),
+    pct_retained_total = round(post_host_bases / raw_bases      * 100, 1)
+  )
+```
+
+---
+
+### Base tracking tables
+
+#### All sample types — QC step
+
+```{r base-table-qc}
+base_full %>%
+  select(sample_type, replicate, raw_bases, post_qc_bases, pct_retained_qc) %>%
+  mutate(
+    raw_bases       = comma(raw_bases),
+    post_qc_bases   = comma(post_qc_bases),
+    pct_retained_qc = paste0(pct_retained_qc, "%")
+  ) %>%
+  rename(
+    `Sample type`      = sample_type,
+    `Replicate`        = replicate,
+    `Raw bases`        = raw_bases,
+    `Post-QC bases`    = post_qc_bases,
+    `% retained (QC)`  = pct_retained_qc
+  ) %>%
+  kable(align = c("l", "c", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  pack_rows("Post-ASC", 1, 6) %>%
+  pack_rows("Post-ASC BF Bolton base + CAT", 7, 12) %>%
+  pack_rows("Post-ASC BPW then RVS", 13, 18) %>%
+  pack_rows("Post-EVI", 19, 24) %>%
+  pack_rows("Post-EVI BF Bolton base + CAT", 25, 30) %>%
+  pack_rows("Post-EVI BPW then RVS", 31, 36)
+```
+
+#### All samples — host-DNA depletion step
+
+```{r base-table-host}
+base_full %>%
+  select(sample_type, replicate, post_qc_bases, post_host_bases, pct_retained_host) %>%
+  mutate(
+    post_qc_bases     = comma(post_qc_bases),
+    post_host_bases   = comma(post_host_bases),
+    pct_retained_host = paste0(pct_retained_host, "%")
+  ) %>%
+  rename(
+    `Sample type`               = sample_type,
+    `Replicate`                 = replicate,
+    `Post-QC bases`             = post_qc_bases,
+    `Post-host depletion bases` = post_host_bases,
+    `% retained (host removal)` = pct_retained_host
+  ) %>%
+  kable(align = c("l", "c", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  pack_rows("Post-ASC", 1, 6) %>%
+  pack_rows("Post-ASC BF Bolton base + CAT", 7, 12) %>%
+  pack_rows("Post-ASC BPW then RVS", 13, 18) %>%
+  pack_rows("Post-EVI", 19, 24) %>%
+  pack_rows("Post-EVI BF Bolton base + CAT", 25, 30) %>%
+  pack_rows("Post-EVI BPW then RVS", 31, 36)
+```
+
+#### All samples — full pipeline summary
+
+```{r base-table-full}
+base_full %>%
+  select(sample_type, replicate, raw_bases, post_qc_bases, post_host_bases, pct_retained_total) %>%
+  mutate(
+    raw_bases          = comma(raw_bases),
+    post_qc_bases      = comma(post_qc_bases),
+    post_host_bases    = comma(post_host_bases),
+    pct_retained_total = paste0(pct_retained_total, "%")
+  ) %>%
+  rename(
+    `Sample type`          = sample_type,
+    `Replicate`            = replicate,
+    `Raw bases`            = raw_bases,
+    `Post-QC`              = post_qc_bases,
+    `Post-host depletion`  = post_host_bases,
+    `% retained (overall)` = pct_retained_total
+  ) %>%
+  kable(align = c("l", "c", "r", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  pack_rows("Post-ASC", 1, 6) %>%
+  pack_rows("Post-ASC BF Bolton base + CAT", 7, 12) %>%
+  pack_rows("Post-ASC BPW then RVS", 13, 18) %>%
+  pack_rows("Post-EVI", 19, 24) %>%
+  pack_rows("Post-EVI BF Bolton base + CAT", 25, 30) %>%
+  pack_rows("Post-EVI BPW then RVS", 31, 36)
+```
+
+---
+
+### Visualisations
+
+```{r base-plot-data}
+base_plot_data <- base_full %>%
+  select(sample_type, replicate, raw_bases, post_qc_bases, post_host_bases) %>%
+  pivot_longer(cols = c(raw_bases, post_qc_bases, post_host_bases),
+               names_to = "stage", values_to = "bases") %>%
+  mutate(
+    stage = factor(stage,
+                   levels = c("raw_bases", "post_qc_bases", "post_host_bases"),
+                   labels = c("Raw", "Post-QC", "Post-host\ndepletion")),
+    sample_type = factor(sample_type, levels = facet_order)
+  )
+```
+
+#### Base counts at each processing step — fixed log₁₀ y-axis
+
+```{r base-plot-log10, fig.width=10, fig.height=9}
+pb_log <- ggplot(base_plot_data, aes(x = stage, y = bases, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~sample_type, scales = "fixed", ncol = 2) +
+  scale_y_log10(labels = label_comma()) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title    = "Base count changes during bioinformatic processing steps",
+    subtitle = "1. Raw bases | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x        = "Processing stage",
+    y        = "Base count (log₁₀)",
+    colour   = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/base_tracking_counts_log10.png", plot = pb_log,
+       width = 10, height = 9, units = "in", dpi = 600)
+
+pb_log
+```
+
+#### Base counts at each processing step — free y-axis
+
+```{r base-plot-free, fig.width=10, fig.height=9}
+pb_free <- ggplot(base_plot_data, aes(x = stage, y = bases, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~sample_type, scales = "free_y", ncol = 2) +
+  scale_y_continuous(labels = label_comma()) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title    = "Base count changes during bioinformatic processing steps",
+    subtitle = "1. Raw bases | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x        = "Processing stage",
+    y        = "Base count",
+    colour   = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/base_tracking_counts.png", plot = pb_free,
+       width = 10, height = 9, units = "in", dpi = 600)
+
+pb_free
+```
+
+#### Base counts at each processing step — row-shared y-axis
+
+```{r base-plot-grid, fig.width=10, fig.height=9}
+base_grid_data <- base_plot_data %>%
+  mutate(
+    processing = if_else(str_detect(sample_type, "EVI"), "Post-EVI", "Post-ASC"),
+    enrichment = case_when(
+      str_detect(sample_type, "BF Bolton") ~ "BF Bolton base + CAT",
+      str_detect(sample_type, "BPW")       ~ "BPW then RVS",
+      TRUE                                 ~ "No enrichment"
+    ),
+    enrichment = factor(enrichment,
+                        levels = c("No enrichment", "BF Bolton base + CAT", "BPW then RVS"))
+  )
+
+pb_grid <- ggplot(base_grid_data, aes(x = stage, y = bases, colour = replicate, group = replicate)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_grid(enrichment ~ processing, scales = "free_y") +
+  scale_y_continuous(labels = label_comma(), breaks = pretty_breaks(n = 8)) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title    = "Base count changes during bioinformatic processing steps (row-shared y-axis)",
+    subtitle = "1. Raw bases | 2. After quality control (Porechop & Nanofilt) | 3. Removal of chicken (host) & contamination reads",
+    x        = "Processing stage",
+    y        = "Base count",
+    colour   = "Sample Number"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(face = "plain", size = 11),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  guides(colour = guide_legend(nrow = 1))
+
+ggsave("figures/base_tracking_counts_row_scales.png", plot = pb_grid,
+       width = 10, height = 9, units = "in", dpi = 600)
+
+pb_grid
+```
+
+#### Heatmap of base counts across processing steps
+
+```{r base-plot-heatmap, fig.width=12, fig.height=10}
+base_heat_data <- base_full %>%
+  select(sample_type, replicate, raw_bases, post_qc_bases, post_host_bases) %>%
+  pivot_longer(cols = c(raw_bases, post_qc_bases, post_host_bases),
+               names_to = "stage", values_to = "bases") %>%
+  mutate(
+    stage = factor(stage,
+                   levels = c("raw_bases", "post_qc_bases", "post_host_bases"),
+                   labels = c("Raw", "Post-QC", "Post-host\ndepletion")),
+    sample_type = factor(sample_type, levels = facet_order),
+    replicate   = factor(replicate, levels = rev(paste0("CH0", 1:6)))
+  )
+
+pb_heat <- ggplot(base_heat_data, aes(x = stage, y = replicate, fill = bases)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = comma(bases, accuracy = 1)), size = 2.4, colour = "black") +
+  facet_wrap(~sample_type, ncol = 2) +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       trans   = "log10",
+                       labels  = label_comma(),
+                       name    = "Base count\n(log₁₀ scale)") +
+  labs(
+    title = "Heatmap of base counts across bioinformatic processing steps",
+    x     = "Processing stage",
+    y     = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    strip.background = element_rect(fill = "steelblue4"),
+    strip.text       = element_text(colour = "white", face = "bold"),
+    panel.grid       = element_blank(),
+    legend.position  = "right"
+  )
+
+ggsave("figures/base_tracking_heatmap.png", plot = pb_heat,
+       width = 10, height = 8, units = "in", dpi = 300)
+
+pb_heat
+```
+
+---
+
+## Base tracking summary statistics
+
+```{r base-summary-stats}
+base_full %>%
+  group_by(sample_type) %>%
+  summarise(
+    `Mean raw bases`            = comma(round(mean(raw_bases))),
+    `Mean post-QC bases`        = comma(round(mean(post_qc_bases))),
+    `Mean post-host bases`      = comma(round(mean(post_host_bases))),
+    `Mean % retained (QC)`      = paste0(round(mean(pct_retained_qc), 1), "%"),
+    `Mean % retained (host dep)`= paste0(round(mean(pct_retained_host), 1), "%"),
+    `Mean % retained (overall)` = paste0(round(mean(pct_retained_total), 1), "%"),
+    .groups = "drop"
+  ) %>%
+  rename(`Sample type` = sample_type) %>%
+  kable(align = c("l", rep("r", 6))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE)
+```

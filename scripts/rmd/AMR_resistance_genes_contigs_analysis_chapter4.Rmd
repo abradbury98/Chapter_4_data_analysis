@@ -1,0 +1,1061 @@
+---
+title: "AMR Resistance Genes: ASC vs EVI — CAT & RVS Contigs"
+author: "Alice Bradbury"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 7)
+```
+
+```{r packages}
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(ggplot2)
+library(patchwork)
+library(scales)
+```
+
+---
+
+# Data Loading
+
+```{r load-data}
+read_abricate_contigs_dir <- function(dir_path) {
+  files <- list.files(dir_path, pattern = "\\.tsv$", full.names = TRUE)
+
+  map_dfr(files, function(f) {
+    df <- read_tsv(f, col_types = cols(.default = "c"), comment = "",
+                   show_col_types = FALSE)
+    if (nrow(df) == 0) return(NULL)
+
+    fname          <- basename(f)
+    sample_id      <- str_extract(fname, "^CH\\d+")
+    sample_type_raw <- str_extract(fname, "(ASC|EVI)")
+    sample_type    <- ifelse(sample_type_raw == "ASC", "Post-ASC", "Post-EVI")
+    database       <- str_extract(fname, "(card|ncbi|resfinder)(?=\\.tsv)")
+
+    df %>%
+      rename_with(~ str_remove(., "^#")) %>%
+      mutate(
+        sample_type = sample_type,
+        sample_id   = sample_id,
+        database    = database,
+        `%COVERAGE` = as.numeric(`%COVERAGE`),
+        `%IDENTITY` = as.numeric(`%IDENTITY`)
+      )
+  })
+}
+
+filter_abricate <- function(data) {
+  data %>% filter(`%COVERAGE` >= 80, `%IDENTITY` >= 90)
+}
+
+cat_data <- filter_abricate(bind_rows(
+  read_abricate_contigs_dir("ABRicate_contigs/ASC_CAT"),
+  read_abricate_contigs_dir("ABRicate_contigs/EVI_CAT")
+))
+
+rvs_data <- filter_abricate(bind_rows(
+  read_abricate_contigs_dir("ABRicate_contigs/ASC_RVS"),
+  read_abricate_contigs_dir("ABRicate_contigs/EVI_RVS")
+))
+
+cat("CAT hits (post-filter):", nrow(cat_data), "\n")
+cat("RVS hits (post-filter):", nrow(rvs_data), "\n")
+
+# Factor order: Post-EVI first throughout all plots
+evi_first <- c("Post-EVI", "Post-ASC")
+cat_data  <- cat_data  %>% mutate(sample_type = factor(sample_type, levels = evi_first))
+rvs_data  <- rvs_data  %>% mutate(sample_type = factor(sample_type, levels = evi_first))
+
+# Host-depleted read counts (post-QC + host DNA removal) — assemblies built from these reads
+read_counts <- tribble(
+  ~sample_type, ~sample_id, ~enrich_method,          ~filtered_reads,
+  "Post-ASC",   "CH01",     "BF Bolton base + CAT",  1009220,
+  "Post-ASC",   "CH02",     "BF Bolton base + CAT",  2074979,
+  "Post-ASC",   "CH03",     "BF Bolton base + CAT",  2558130,
+  "Post-ASC",   "CH04",     "BF Bolton base + CAT",    13862,
+  "Post-ASC",   "CH05",     "BF Bolton base + CAT",  3809387,
+  "Post-ASC",   "CH06",     "BF Bolton base + CAT",   763614,
+  "Post-EVI",   "CH01",     "BF Bolton base + CAT",  1720176,
+  "Post-EVI",   "CH02",     "BF Bolton base + CAT",  5286510,
+  "Post-EVI",   "CH03",     "BF Bolton base + CAT",  2483850,
+  "Post-EVI",   "CH04",     "BF Bolton base + CAT",  4470527,
+  "Post-EVI",   "CH05",     "BF Bolton base + CAT",  1684200,
+  "Post-EVI",   "CH06",     "BF Bolton base + CAT",  3775897,
+  "Post-ASC",   "CH01",     "BPW + RVS",             4627620,
+  "Post-ASC",   "CH02",     "BPW + RVS",             2624242,
+  "Post-ASC",   "CH03",     "BPW + RVS",               4251,
+  "Post-ASC",   "CH04",     "BPW + RVS",               5585,
+  "Post-ASC",   "CH05",     "BPW + RVS",             2184262,
+  "Post-ASC",   "CH06",     "BPW + RVS",             1845128,
+  "Post-EVI",   "CH01",     "BPW + RVS",             1041538,
+  "Post-EVI",   "CH02",     "BPW + RVS",             3083490,
+  "Post-EVI",   "CH03",     "BPW + RVS",             1596293,
+  "Post-EVI",   "CH04",     "BPW + RVS",             1406725,
+  "Post-EVI",   "CH05",     "BPW + RVS",             1932407,
+  "Post-EVI",   "CH06",     "BPW + RVS",              949873
+)
+
+cat_data <- cat_data %>%
+  left_join(read_counts %>% filter(enrich_method == "BF Bolton base + CAT"),
+            by = c("sample_type", "sample_id"))
+
+rvs_data <- rvs_data %>%
+  left_join(read_counts %>% filter(enrich_method == "BPW + RVS"),
+            by = c("sample_type", "sample_id"))
+
+# Minimum read threshold — excludes low-depth samples from normalised analyses
+min_reads    <- 100000
+cat_data_rpm <- cat_data %>% filter(filtered_reads >= min_reads)
+rvs_data_rpm <- rvs_data %>% filter(filtered_reads >= min_reads)
+
+cat("Samples excluded from normalised analyses (< 100,000 filtered reads):\n")
+print(read_counts %>% filter(filtered_reads < min_reads) %>%
+        select(sample_type, sample_id, enrich_method, filtered_reads))
+```
+
+---
+
+# Helper Functions
+
+```{r helpers}
+dir.create("figures_contigs", showWarnings = FALSE)
+
+# Colours
+db_colours    <- c(card = "#E64B35", ncbi = "#4DBBD5", resfinder = "#00A087")
+db_labels     <- c(card = "CARD", ncbi = "NCBI", resfinder = "ResFinder")
+type_colours  <- c(`Post-ASC` = "#F39B7F", `Post-EVI` = "#8491B4")
+annot_colours <- list(Sample_Type = c(`Post-ASC` = "#F39B7F", `Post-EVI` = "#8491B4"))
+
+pub_theme <- theme_classic(base_size = 14) +
+  theme(
+    strip.background  = element_rect(fill = "#3C5488", colour = NA),
+    strip.text        = element_text(colour = "white", face = "bold", size = 13),
+    axis.text         = element_text(colour = "black"),
+    axis.title        = element_text(face = "bold"),
+    legend.title      = element_text(face = "bold"),
+    legend.position   = "bottom",
+    plot.title        = element_text(face = "bold", size = 14),
+    panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+  )
+
+save_gg <- function(p, filename, w = 12, h = 7) {
+  ggsave(file.path("figures_contigs", filename), plot = p,
+         width = w, height = h, units = "in", dpi = 600)
+}
+
+save_pheatmap <- function(hm, filename, w, h) {
+  png(file.path("figures_contigs", filename), width = w, height = h,
+      units = "in", res = 600)
+  grid::grid.newpage()
+  grid::grid.draw(hm$gtable)
+  dev.off()
+}
+
+# ── Bar charts ────────────────────────────────────────────────────────────────
+plot_gene_counts <- function(data, title_prefix) {
+  count_data <- data %>%
+    group_by(sample_type, sample_id, database) %>%
+    summarise(n_hits = n(), n_unique_genes = n_distinct(GENE), .groups = "drop") %>%
+    mutate(database = recode(database, !!!db_labels))
+
+  p_hits <- ggplot(count_data,
+                   aes(x = sample_id, y = n_hits, fill = database)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+    facet_wrap(~ sample_type) +
+    scale_fill_manual(values = setNames(db_colours, db_labels), name = "Database") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    labs(title = paste0("(A) ", title_prefix, " — Total AMR Gene Hits per Sample"),
+         subtitle = "Coverage \u2265 80%, Identity \u2265 90%",
+         x = NULL, y = "Number of Hits") +
+    pub_theme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  p_unique <- ggplot(count_data,
+                     aes(x = sample_id, y = n_unique_genes, fill = database)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+    facet_wrap(~ sample_type) +
+    scale_fill_manual(values = setNames(db_colours, db_labels), name = "Database") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    labs(title = paste0("(B) ", title_prefix, " — Unique AMR Genes per Sample"),
+         x = "Sample", y = "Number of Unique Genes") +
+    pub_theme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  combined <- p_hits / p_unique
+  print(combined)
+  save_gg(combined, paste0(title_prefix, "_gene_counts.png"), w = 12, h = 10)
+}
+
+plot_comparison <- function(data, title_prefix) {
+  compare_data <- data %>%
+    group_by(sample_type, database) %>%
+    summarise(n_unique_genes = n_distinct(GENE), .groups = "drop") %>%
+    mutate(database = recode(database, !!!db_labels))
+
+  p <- ggplot(compare_data,
+              aes(x = database, y = n_unique_genes, fill = sample_type)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = n_unique_genes),
+              position = position_dodge(width = 0.9), vjust = -0.5, size = 4.5,
+              fontface = "bold") +
+    scale_fill_manual(values = type_colours, name = "Sample Type") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+    labs(title = paste0(title_prefix, " — Unique AMR Genes: Post-ASC vs Post-EVI by Database"),
+         x = "Database", y = "Number of Unique Genes") +
+    pub_theme
+
+  print(p)
+  save_gg(p, paste0(title_prefix, "_comparison.png"))
+}
+
+plot_resistance_classes <- function(data, title_prefix) {
+  res_count <- data %>%
+    filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+    mutate(RESISTANCE = str_split(RESISTANCE, ";")) %>%
+    unnest(RESISTANCE) %>%
+    mutate(RESISTANCE = str_trim(str_to_title(RESISTANCE))) %>%
+    filter(RESISTANCE != "") %>%
+    group_by(sample_type, RESISTANCE) %>%
+    summarise(total = n(), .groups = "drop") %>%
+    group_by(sample_type) %>%
+    slice_max(order_by = total, n = 15) %>%
+    ungroup()
+
+  p <- ggplot(res_count,
+              aes(x = reorder_within(RESISTANCE, total, sample_type),
+                  y = total, fill = sample_type)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ sample_type, scales = "free_y") +
+    scale_x_reordered() +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_fill_manual(values = type_colours) +
+    coord_flip() +
+    labs(title = paste0(title_prefix, " — Top 15 AMR Resistance Classes"),
+         x = NULL, y = "Total Hits") +
+    pub_theme +
+    theme(axis.text.y = element_text(size = 12))
+
+  print(p)
+  save_gg(p, paste0(title_prefix, "_resistance_classes.png"), w = 13, h = 7)
+}
+
+# ── Presence / absence heatmap ────────────────────────────────────────────────
+sort_cols <- function(mat) {
+  col_order <- colnames(mat) %>%
+    tibble(label = .) %>%
+    mutate(
+      stype = str_extract(label, "^(EVI|ASC)"),
+      snum  = as.integer(str_extract(label, "(?<=CH)\\d+"))
+    ) %>%
+    arrange(desc(stype), snum) %>%
+    pull(label)
+  mat[, col_order, drop = FALSE]
+}
+
+make_heatmap_matrix <- function(data, db) {
+  mat <- data %>%
+    filter(database == db) %>%
+    mutate(label = paste0(str_extract(as.character(sample_type), "(ASC|EVI)"),
+                          "-", sample_id)) %>%
+    group_by(GENE, label) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    pivot_wider(names_from = label, values_from = n, values_fill = 0) %>%
+    column_to_rownames("GENE")
+
+  gene_totals <- rowSums(mat)
+  mat <- mat[order(gene_totals, decreasing = TRUE)[1:min(40, nrow(mat))], ]
+  sort_cols(mat)
+}
+
+make_col_annot <- function(mat) {
+  data.frame(
+    Sample_Type = ifelse(str_starts(colnames(mat), "ASC"), "Post-ASC", "Post-EVI"),
+    row.names = colnames(mat)
+  )
+}
+
+db_display <- c(card = "CARD", ncbi = "NCBI", resfinder = "ResFinder")
+
+# Normalised (RPM) gene hit bar chart
+plot_gene_counts_rpm <- function(data, title_prefix) {
+  rpm_data <- data %>%
+    group_by(sample_type, sample_id, database, filtered_reads) %>%
+    summarise(n_hits = n(), .groups = "drop") %>%
+    mutate(rpm      = n_hits / filtered_reads * 1e6,
+           database = recode(database, !!!db_labels))
+
+  p <- ggplot(rpm_data, aes(x = sample_id, y = rpm, fill = database)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+    facet_wrap(~ sample_type) +
+    scale_fill_manual(values = setNames(db_colours, db_labels), name = "Database") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       labels = scales::comma) +
+    labs(title = paste0(title_prefix,
+                        " — AMR Gene Hits per Million Reads (RPM) per Sample"),
+         subtitle = "Normalised by host-depleted read count",
+         x = "Sample", y = "Hits per Million Reads") +
+    pub_theme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+  save_gg(p, paste0(title_prefix, "_gene_counts_rpm.png"), w = 12, h = 6)
+}
+
+# Unique genes per million reads (UGPMR) per sample
+plot_unique_rpm <- function(data, title_prefix) {
+  ugpmr <- data %>%
+    group_by(sample_type, sample_id, database, filtered_reads) %>%
+    summarise(n_unique = n_distinct(GENE), .groups = "drop") %>%
+    mutate(ugpmr    = n_unique / filtered_reads * 1e6,
+           database = recode(database, !!!db_labels))
+
+  p <- ggplot(ugpmr, aes(x = sample_id, y = ugpmr, fill = database)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+    facet_wrap(~ sample_type) +
+    scale_fill_manual(values = setNames(db_colours, db_labels), name = "Database") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       labels = scales::comma) +
+    labs(title = paste0(title_prefix,
+                        " — Unique AMR Genes per Million Reads (UGPMR) per Sample"),
+         subtitle = "Normalised by host-depleted read count; samples with <100,000 reads excluded",
+         x = "Sample", y = "Unique Genes per Million Reads") +
+    pub_theme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+  save_gg(p, paste0(title_prefix, "_unique_rpm.png"), w = 12, h = 6)
+}
+
+plot_heatmaps <- function(data, title_prefix) {
+  cols <- list(
+    card      = c("#F7F7F7", "#FED976", "#E31A1C"),
+    ncbi      = c("#F7F7F7", "#A6CEE3", "#1F78B4"),
+    resfinder = c("#F7F7F7", "#B2DF8A", "#33A02C")
+  )
+
+  for (db in names(cols)) {
+    mat <- make_heatmap_matrix(data, db)
+    hm <- pheatmap(
+      mat,
+      color             = colorRampPalette(cols[[db]])(100),
+      annotation_col    = make_col_annot(mat),
+      annotation_colors = annot_colours,
+      cluster_rows      = FALSE,
+      cluster_cols      = FALSE,
+      fontsize_row      = 10,
+      fontsize_col      = 11,
+      fontsize          = 11,
+      angle_col         = 45,
+      cellwidth         = 38,
+      cellheight        = 14,
+      main              = paste0(title_prefix, " \u2014 ", db_display[db],
+                                 " Database \u2014 Top 40 AMR Genes (Hit Count)"),
+      border_color      = "grey90",
+      na_col            = "grey95",
+      silent            = TRUE
+    )
+    print(hm)
+    save_pheatmap(hm,
+                  paste0(title_prefix, "_heatmap_", db, ".png"),
+                  w = 13, h = 11)
+  }
+
+  # Resistance class heatmap (all databases combined)
+  res_mat <- data %>%
+    filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+    mutate(RESISTANCE = str_split(RESISTANCE, ";")) %>%
+    unnest(RESISTANCE) %>%
+    mutate(
+      RESISTANCE = str_trim(str_to_title(RESISTANCE)),
+      label = paste0(str_extract(as.character(sample_type), "(ASC|EVI)"),
+                     "-", sample_id)
+    ) %>%
+    filter(RESISTANCE != "") %>%
+    group_by(RESISTANCE, label) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    pivot_wider(names_from = label, values_from = n, values_fill = 0) %>%
+    column_to_rownames("RESISTANCE")
+
+  res_mat <- res_mat[apply(res_mat, 1, max) >= 2, ]
+  res_mat <- sort_cols(res_mat)
+
+  hm_res <- pheatmap(
+    res_mat,
+    color             = colorRampPalette(c("#F7F7F7", "#FEE08B", "#9E0142"))(100),
+    annotation_col    = make_col_annot(res_mat),
+    annotation_colors = annot_colours,
+    cluster_rows      = FALSE,
+    cluster_cols      = FALSE,
+    fontsize_row      = 10,
+    fontsize_col      = 11,
+    fontsize          = 11,
+    angle_col         = 45,
+    cellwidth         = 38,
+    cellheight        = 14,
+    main              = paste0(title_prefix,
+                               " \u2014 Resistance Classes Across All Databases (Hit Count)"),
+    border_color      = "grey90",
+    silent            = TRUE
+  )
+  print(hm_res)
+  save_pheatmap(hm_res,
+                paste0(title_prefix, "_heatmap_resistance_classes.png"),
+                w = 13, h = 14)
+}
+
+# ── Gene presence / absence heatmap ──────────────────────────────────────────
+plot_presence_absence <- function(data, title_prefix, db) {
+  mat_pa <- data %>%
+    filter(database == db) %>%
+    mutate(label = paste0(str_extract(as.character(sample_type), "(ASC|EVI)"),
+                          "-", sample_id)) %>%
+    distinct(GENE, label) %>%
+    mutate(present = 1L) %>%
+    pivot_wider(names_from = label, values_from = present, values_fill = 0L) %>%
+    column_to_rownames("GENE")
+
+  # Keep genes present in >= 2 samples
+  mat_pa <- mat_pa[rowSums(mat_pa) >= 2, , drop = FALSE]
+  if (nrow(mat_pa) == 0) {
+    message("No genes present in >= 2 samples for ", db); return(invisible(NULL))
+  }
+  mat_pa <- sort_cols(mat_pa)
+
+  hm <- pheatmap(
+    mat_pa,
+    color             = c("#F7F7F7", "#3C5488"),
+    annotation_col    = make_col_annot(mat_pa),
+    annotation_colors = annot_colours,
+    cluster_rows      = FALSE,
+    cluster_cols      = FALSE,
+    fontsize_row      = 9,
+    fontsize_col      = 11,
+    angle_col         = 45,
+    cellwidth         = 38,
+    cellheight        = 13,
+    main              = paste0(title_prefix, " \u2014 ", db_display[db],
+                               " — Gene Presence / Absence"),
+    border_color      = "grey90",
+    legend            = FALSE,
+    silent            = TRUE
+  )
+  print(hm)
+  save_pheatmap(hm,
+                paste0(title_prefix, "_presence_absence_", db, ".png"),
+                w = 13, h = max(6, nrow(mat_pa) * 0.3 + 3))
+}
+```
+
+---
+
+# CAT Contigs
+
+## Gene Counts
+
+```{r cat-counts, fig.height=10}
+plot_gene_counts(cat_data, "CAT")
+```
+
+## Normalised Gene Counts (RPM)
+
+```{r cat-rpm, fig.height=6}
+plot_gene_counts_rpm(cat_data_rpm, "CAT")
+```
+
+## Unique Genes per Million Reads (UGPMR)
+
+```{r cat-unique-rpm, fig.height=6}
+plot_unique_rpm(cat_data_rpm, "CAT")
+```
+
+## ASC vs EVI Comparison
+
+```{r cat-comparison, fig.height=5}
+plot_comparison(cat_data, "CAT")
+```
+
+## Resistance Classes
+
+```{r cat-resistance, fig.height=6, fig.width=13}
+plot_resistance_classes(cat_data, "CAT")
+```
+
+## Heatmaps (Hit Count)
+
+```{r cat-heatmaps, fig.height=9, fig.width=13}
+plot_heatmaps(cat_data, "CAT")
+```
+
+## Gene Presence / Absence
+
+```{r cat-pa-card, fig.height=9, fig.width=13}
+plot_presence_absence(cat_data, "CAT", "card")
+```
+
+```{r cat-pa-ncbi, fig.height=9, fig.width=13}
+plot_presence_absence(cat_data, "CAT", "ncbi")
+```
+
+```{r cat-pa-resfinder, fig.height=9, fig.width=13}
+plot_presence_absence(cat_data, "CAT", "resfinder")
+```
+
+---
+
+# RVS Contigs
+
+## Gene Counts
+
+```{r rvs-counts, fig.height=10}
+plot_gene_counts(rvs_data, "RVS")
+```
+
+## Normalised Gene Counts (RPM)
+
+```{r rvs-rpm, fig.height=6}
+plot_gene_counts_rpm(rvs_data_rpm, "RVS")
+```
+
+## Unique Genes per Million Reads (UGPMR)
+
+```{r rvs-unique-rpm, fig.height=6}
+plot_unique_rpm(rvs_data_rpm, "RVS")
+```
+
+## ASC vs EVI Comparison
+
+```{r rvs-comparison, fig.height=5}
+plot_comparison(rvs_data, "RVS")
+```
+
+## Resistance Classes
+
+```{r rvs-resistance, fig.height=6, fig.width=13}
+plot_resistance_classes(rvs_data, "RVS")
+```
+
+## Heatmaps (Hit Count)
+
+```{r rvs-heatmaps, fig.height=9, fig.width=13}
+plot_heatmaps(rvs_data, "RVS")
+```
+
+## Gene Presence / Absence
+
+```{r rvs-pa-card, fig.height=9, fig.width=13}
+plot_presence_absence(rvs_data, "RVS", "card")
+```
+
+```{r rvs-pa-ncbi, fig.height=9, fig.width=13}
+plot_presence_absence(rvs_data, "RVS", "ncbi")
+```
+
+```{r rvs-pa-resfinder, fig.height=9, fig.width=13}
+plot_presence_absence(rvs_data, "RVS", "resfinder")
+```
+
+---
+
+# CAT vs RVS: Cross-Enrichment Comparison
+
+```{r combined-data}
+all_combined <- bind_rows(
+  cat_data %>% mutate(enrich_method = "BF Bolton base + CAT"),
+  rvs_data %>% mutate(enrich_method = "BPW + RVS")
+) %>%
+  mutate(
+    sample_type   = factor(sample_type, levels = evi_first),
+    enrich_method = factor(enrich_method,
+                           levels = c("BF Bolton base + CAT", "BPW + RVS"))
+  )
+
+all_combined_rpm <- all_combined %>% filter(filtered_reads >= min_reads)
+```
+
+## Unique Resistance Genes: Post-ASC vs Post-EVI across Enrichment Methods
+
+```{r cross-unique-genes, fig.height=6, fig.width=11}
+unique_genes <- all_combined %>%
+  group_by(sample_type, enrich_method, database) %>%
+  summarise(n_unique = n_distinct(GENE), .groups = "drop") %>%
+  mutate(database = recode(database, !!!db_labels))
+
+p_cross <- ggplot(unique_genes,
+                  aes(x = enrich_method, y = n_unique, fill = sample_type)) +
+  geom_col(position = "dodge", colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = n_unique),
+            position = position_dodge(width = 0.9),
+            vjust = -0.5, size = 4, fontface = "bold") +
+  facet_wrap(~ database) +
+  scale_fill_manual(values = type_colours, name = "Sample Type") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Unique AMR Genes: Post-ASC vs Post-EVI by Enrichment Method and Database",
+       x = "Enrichment Method", y = "Number of Unique Genes") +
+  pub_theme +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+print(p_cross)
+save_gg(p_cross, "cross_unique_genes.png", w = 11, h = 6)
+```
+
+## Resistance Class Profiles: Do Classes Change Between Groups?
+
+```{r cross-resistance-classes, fig.height=8, fig.width=13}
+res_combined <- all_combined %>%
+  filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+  mutate(RESISTANCE = str_split(RESISTANCE, ";")) %>%
+  unnest(RESISTANCE) %>%
+  mutate(RESISTANCE = str_trim(str_to_title(RESISTANCE))) %>%
+  filter(RESISTANCE != "")
+
+top_classes <- res_combined %>%
+  mutate(RESISTANCE = str_replace_all(RESISTANCE, "_", " ")) %>%
+  count(RESISTANCE, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  pull(RESISTANCE)
+
+res_profile <- res_combined %>%
+  mutate(RESISTANCE = str_replace_all(RESISTANCE, "_", " ")) %>%
+  filter(RESISTANCE %in% top_classes) %>%
+  group_by(sample_type, enrich_method, RESISTANCE) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(sample_type, enrich_method) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(RESISTANCE = factor(RESISTANCE, levels = rev(top_classes)))
+
+p_stack <- ggplot(res_profile,
+                  aes(x = sample_type, y = pct, fill = RESISTANCE)) +
+  geom_col(colour = "white", linewidth = 0.25, width = 0.65) +
+  facet_wrap(~ enrich_method) +
+  scale_fill_manual(
+    values = colorRampPalette(brewer.pal(11, "Spectral"))(15),
+    name = "Resistance Class"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.01)),
+                     labels = function(x) paste0(x, "%")) +
+  labs(title = "Resistance Class Composition by Sample Type and Enrichment Method",
+       subtitle = "Top 15 resistance classes as % of total hits",
+       x = "Sample Type", y = "Proportion of Hits (%)") +
+  pub_theme +
+  guides(fill = guide_legend(ncol = 1, keyheight = 0.75, keywidth = 0.75,
+                              override.aes = list(colour = NA)))
+
+print(p_stack)
+save_gg(p_stack, "cross_resistance_profile.png", w = 11, h = 8)
+```
+
+```{r cross-resistance-dotplot, fig.height=8, fig.width=13}
+res_dot <- res_combined %>%
+  mutate(RESISTANCE = str_replace_all(RESISTANCE, "_", " ")) %>%
+  filter(RESISTANCE %in% top_classes) %>%
+  group_by(sample_type, enrich_method, RESISTANCE) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(RESISTANCE = factor(RESISTANCE, levels = rev(top_classes)))
+
+p_dot <- ggplot(res_dot,
+                aes(x = n, y = RESISTANCE, colour = sample_type)) +
+  geom_line(aes(group = RESISTANCE), colour = "grey75", linewidth = 0.7) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  facet_wrap(~ enrich_method, scales = "free_x") +
+  scale_colour_manual(values = type_colours, name = "Sample Type") +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.1)),
+                     labels = scales::comma) +
+  labs(title = "Resistance Class Hit Counts: Post-ASC vs Post-EVI by Enrichment Method",
+       subtitle = "Lines connect Post-ASC and Post-EVI for each resistance class",
+       x = "Total Hits", y = NULL) +
+  pub_theme +
+  theme(panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.4),
+        axis.text.y = element_text(size = 11))
+
+print(p_dot)
+save_gg(p_dot, "cross_resistance_dotplot.png", w = 13, h = 8)
+```
+
+## Normalised Cleveland Dot Plot (RPM)
+
+```{r cross-resistance-dotplot-rpm, fig.height=8, fig.width=13}
+res_dot_rpm <- all_combined_rpm %>%
+  filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+  mutate(RESISTANCE = str_split(RESISTANCE, ";")) %>%
+  unnest(RESISTANCE) %>%
+  mutate(RESISTANCE = str_trim(str_to_title(str_replace_all(RESISTANCE, "_", " ")))) %>%
+  filter(RESISTANCE %in% top_classes) %>%
+  group_by(sample_type, enrich_method, sample_id, filtered_reads, RESISTANCE) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(rpm = n / filtered_reads * 1e6) %>%
+  group_by(sample_type, enrich_method, RESISTANCE) %>%
+  summarise(mean_rpm = mean(rpm), se_rpm = sd(rpm) / sqrt(n()),
+            .groups = "drop") %>%
+  mutate(RESISTANCE = factor(RESISTANCE, levels = rev(top_classes)))
+
+p_dot_rpm <- ggplot(res_dot_rpm,
+                    aes(x = mean_rpm, y = RESISTANCE, colour = sample_type)) +
+  geom_line(aes(group = RESISTANCE), colour = "grey75", linewidth = 0.7) +
+  geom_errorbarh(aes(xmin = mean_rpm - se_rpm, xmax = mean_rpm + se_rpm),
+                 height = 0.25, linewidth = 0.5, alpha = 0.7) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  facet_wrap(~ enrich_method, scales = "free_x") +
+  scale_colour_manual(values = type_colours, name = "Sample Type") +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.15)),
+                     labels = scales::comma) +
+  labs(title = "Resistance Class Prevalence (RPM): Post-ASC vs Post-EVI by Enrichment Method",
+       subtitle = "Mean \u00b1 SE across replicates; normalised by host-depleted read count",
+       x = "Mean Hits per Million Reads (RPM)", y = NULL) +
+  pub_theme +
+  theme(panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.4),
+        axis.text.y = element_text(size = 11))
+
+print(p_dot_rpm)
+save_gg(p_dot_rpm, "cross_resistance_dotplot_rpm.png", w = 13, h = 8)
+```
+
+---
+
+# Statistical Analysis
+
+```{r stats-setup}
+# Per-sample hit count per resistance class (zeros filled for missing combinations)
+hits_per_class <- all_combined %>%
+  filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+  mutate(RESISTANCE = str_split(RESISTANCE, ";")) %>%
+  unnest(RESISTANCE) %>%
+  mutate(RESISTANCE = str_trim(str_to_title(str_replace_all(RESISTANCE, "_", " ")))) %>%
+  filter(RESISTANCE %in% top_classes) %>%
+  group_by(enrich_method, sample_type, sample_id, RESISTANCE) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  complete(nesting(enrich_method, sample_type, sample_id),
+           RESISTANCE, fill = list(n = 0))
+
+# Per-sample RPM per resistance class (zeros filled; low-depth samples excluded)
+rpm_per_class <- all_combined_rpm %>%
+  filter(!is.na(RESISTANCE), RESISTANCE != "") %>%
+  mutate(RESISTANCE = str_split(RESISTANCE, ";")) %>%
+  unnest(RESISTANCE) %>%
+  mutate(RESISTANCE = str_trim(str_to_title(str_replace_all(RESISTANCE, "_", " ")))) %>%
+  filter(RESISTANCE %in% top_classes) %>%
+  group_by(enrich_method, sample_type, sample_id, filtered_reads, RESISTANCE) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(rpm = n / filtered_reads * 1e6) %>%
+  complete(nesting(enrich_method, sample_type, sample_id, filtered_reads),
+           RESISTANCE, fill = list(n = 0, rpm = 0))
+
+run_wilcox <- function(data, group_var, level_a, level_b, split_var, value_col = "n") {
+  data %>%
+    group_by(across(all_of(c(split_var, "RESISTANCE")))) %>%
+    filter(n_distinct(.data[[group_var]]) == 2) %>%
+    summarise(
+      p_value  = wilcox.test(.data[[value_col]][.data[[group_var]] == level_a],
+                             .data[[value_col]][.data[[group_var]] == level_b],
+                             exact = FALSE)$p.value,
+      median_a = median(.data[[value_col]][.data[[group_var]] == level_a]),
+      median_b = median(.data[[value_col]][.data[[group_var]] == level_b]),
+      .groups  = "drop"
+    ) %>%
+    rename(!!paste0("median_", level_a) := median_a,
+           !!paste0("median_", level_b) := median_b) %>%
+    mutate(sig = case_when(p_value < 0.001 ~ "***",
+                           p_value < 0.01  ~ "**",
+                           p_value < 0.05  ~ "*",
+                           TRUE            ~ "ns"))
+}
+```
+
+## Post-EVI vs Post-ASC (within each enrichment method)
+
+```{r stats-evi-vs-asc}
+wilcox_evi_asc <- run_wilcox(hits_per_class,
+                              group_var = "sample_type",
+                              level_a   = "Post-EVI",
+                              level_b   = "Post-ASC",
+                              split_var = "enrich_method")
+
+wilcox_evi_asc %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(enrich_method, p_value) %>%
+  knitr::kable(caption = "Wilcoxon rank-sum test: Post-EVI vs Post-ASC per resistance class")
+```
+
+## CAT vs RVS (within each sample type)
+
+```{r stats-cat-vs-rvs}
+wilcox_cat_rvs <- run_wilcox(hits_per_class,
+                              group_var = "enrich_method",
+                              level_a   = "BF Bolton base + CAT",
+                              level_b   = "BPW + RVS",
+                              split_var = "sample_type")
+
+wilcox_cat_rvs %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(sample_type, p_value) %>%
+  knitr::kable(caption = "Wilcoxon rank-sum test: BF Bolton base + CAT vs BPW + RVS per resistance class")
+```
+
+## Overall AMR Burden: Total Hits per Sample
+
+```{r stats-total-hits, fig.height=5, fig.width=10}
+total_hits <- all_combined %>%
+  group_by(enrich_method, sample_type, sample_id) %>%
+  summarise(n = n(), .groups = "drop")
+
+total_wilcox <- total_hits %>%
+  group_by(enrich_method) %>%
+  summarise(
+    p_value        = wilcox.test(n[sample_type == "Post-EVI"],
+                                 n[sample_type == "Post-ASC"],
+                                 exact = FALSE)$p.value,
+    median_PostEVI = median(n[sample_type == "Post-EVI"]),
+    median_PostASC = median(n[sample_type == "Post-ASC"]),
+    .groups        = "drop"
+  ) %>%
+  mutate(sig = case_when(p_value < 0.001 ~ "***",
+                         p_value < 0.01  ~ "**",
+                         p_value < 0.05  ~ "*",
+                         TRUE            ~ "ns"))
+
+knitr::kable(total_wilcox %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+             caption = "Wilcoxon rank-sum test: overall AMR burden (total hits) Post-EVI vs Post-ASC")
+
+p_total <- ggplot(total_hits,
+                  aes(x = sample_type, y = n, fill = sample_type)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.1, size = 2.5, alpha = 0.8, aes(colour = sample_type)) +
+  geom_text(data = total_wilcox,
+            aes(x = 1.5, y = Inf, label = paste0("p = ", round(p_value, 3),
+                                                   "  ", sig)),
+            vjust = 1.5, size = 4, fontface = "italic", inherit.aes = FALSE) +
+  facet_wrap(~ enrich_method) +
+  scale_fill_manual(values   = type_colours, guide = "none") +
+  scale_colour_manual(values = type_colours, guide = "none") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Total AMR Gene Hits per Sample (Contigs)",
+       subtitle = "Wilcoxon rank-sum test",
+       x = NULL, y = "Total Hits") +
+  pub_theme
+
+print(p_total)
+save_gg(p_total, "stats_total_hits_boxplot.png", w = 10, h = 5)
+```
+
+## Unique Gene Diversity: Post-EVI vs Post-ASC
+
+```{r stats-unique-genes, fig.height=9, fig.width=11}
+unique_per_sample <- all_combined %>%
+  group_by(enrich_method, sample_type, sample_id, database) %>%
+  summarise(n_unique = n_distinct(GENE), .groups = "drop") %>%
+  mutate(database_label = recode(database, !!!db_labels))
+
+unique_wilcox <- unique_per_sample %>%
+  group_by(enrich_method, database_label) %>%
+  summarise(
+    p_value        = wilcox.test(n_unique[sample_type == "Post-EVI"],
+                                 n_unique[sample_type == "Post-ASC"],
+                                 exact = FALSE)$p.value,
+    median_PostEVI = median(n_unique[sample_type == "Post-EVI"]),
+    median_PostASC = median(n_unique[sample_type == "Post-ASC"]),
+    .groups        = "drop"
+  ) %>%
+  mutate(sig = case_when(p_value < 0.001 ~ "***",
+                         p_value < 0.01  ~ "**",
+                         p_value < 0.05  ~ "*",
+                         TRUE            ~ "ns"))
+
+knitr::kable(unique_wilcox %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+             caption = "Wilcoxon rank-sum test: unique AMR genes per sample, Post-EVI vs Post-ASC")
+
+p_unique_box <- ggplot(unique_per_sample,
+                       aes(x = sample_type, y = n_unique, fill = sample_type)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.1, size = 2.5, alpha = 0.8,
+              aes(colour = sample_type)) +
+  geom_text(data = unique_wilcox,
+            aes(x = 1.5, y = Inf,
+                label = paste0("p = ", round(p_value, 3), "  ", sig)),
+            vjust = 1.5, size = 3.8, fontface = "italic", inherit.aes = FALSE) +
+  facet_grid(database_label ~ enrich_method) +
+  scale_fill_manual(values = type_colours, guide = "none") +
+  scale_colour_manual(values = type_colours, guide = "none") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Unique AMR Genes per Sample: Post-EVI vs Post-ASC (Contigs)",
+       subtitle = "Wilcoxon rank-sum test; each point = one replicate",
+       x = NULL, y = "Number of Unique Genes") +
+  pub_theme
+
+print(p_unique_box)
+save_gg(p_unique_box, "stats_unique_genes_boxplot.png", w = 11, h = 9)
+```
+
+---
+
+# RPM-Normalised Statistical Analysis
+
+## Post-EVI vs Post-ASC (within each enrichment method) — RPM
+
+```{r stats-rpm-evi-vs-asc}
+wilcox_rpm_evi_asc <- run_wilcox(rpm_per_class,
+                                  group_var  = "sample_type",
+                                  level_a    = "Post-EVI",
+                                  level_b    = "Post-ASC",
+                                  split_var  = "enrich_method",
+                                  value_col  = "rpm")
+
+wilcox_rpm_evi_asc %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(enrich_method, p_value) %>%
+  knitr::kable(caption = "Wilcoxon rank-sum test (RPM): Post-EVI vs Post-ASC per resistance class")
+```
+
+```{r stats-rpm-evi-vs-asc-plot, fig.height=8, fig.width=14}
+sig_annot_rpm <- wilcox_rpm_evi_asc %>%
+  filter(sig != "ns") %>%
+  mutate(RESISTANCE = factor(RESISTANCE, levels = rev(top_classes)))
+
+star_pos_rpm <- res_dot_rpm %>%
+  group_by(enrich_method, RESISTANCE) %>%
+  summarise(x_pos = max(mean_rpm + se_rpm, na.rm = TRUE), .groups = "drop") %>%
+  inner_join(sig_annot_rpm, by = c("enrich_method", "RESISTANCE"))
+
+p_dot_rpm_sig <- p_dot_rpm +
+  geom_text(data = star_pos_rpm,
+            aes(x = x_pos, y = RESISTANCE, label = sig),
+            colour = "black", size = 4.5, hjust = -0.2,
+            fontface = "bold", inherit.aes = FALSE) +
+  labs(title = "Resistance Class Prevalence (RPM) with Significance Annotations",
+       subtitle = "Stars indicate Wilcoxon p-value: * <0.05  ** <0.01  *** <0.001\nSamples with <100,000 reads excluded") +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.25)),
+                     labels = scales::comma)
+
+print(p_dot_rpm_sig)
+save_gg(p_dot_rpm_sig, "cross_resistance_dotplot_rpm_sig.png", w = 14, h = 8)
+```
+
+## CAT vs RVS (within each sample type) — RPM
+
+```{r stats-rpm-cat-vs-rvs}
+wilcox_rpm_cat_rvs <- run_wilcox(rpm_per_class,
+                                  group_var = "enrich_method",
+                                  level_a   = "BF Bolton base + CAT",
+                                  level_b   = "BPW + RVS",
+                                  split_var = "sample_type",
+                                  value_col = "rpm")
+
+wilcox_rpm_cat_rvs %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(sample_type, p_value) %>%
+  knitr::kable(caption = "Wilcoxon rank-sum test (RPM): BF Bolton base + CAT vs BPW + RVS per resistance class")
+```
+
+## Overall AMR Burden: Total RPM per Sample
+
+```{r stats-total-rpm, fig.height=5, fig.width=10}
+total_rpm <- all_combined_rpm %>%
+  group_by(enrich_method, sample_type, sample_id, filtered_reads) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(rpm = n / filtered_reads * 1e6)
+
+total_rpm_wilcox <- total_rpm %>%
+  group_by(enrich_method) %>%
+  summarise(
+    p_value        = wilcox.test(rpm[sample_type == "Post-EVI"],
+                                 rpm[sample_type == "Post-ASC"],
+                                 exact = FALSE)$p.value,
+    median_PostEVI = median(rpm[sample_type == "Post-EVI"]),
+    median_PostASC = median(rpm[sample_type == "Post-ASC"]),
+    .groups        = "drop"
+  ) %>%
+  mutate(sig = case_when(p_value < 0.001 ~ "***",
+                         p_value < 0.01  ~ "**",
+                         p_value < 0.05  ~ "*",
+                         TRUE            ~ "ns"))
+
+knitr::kable(total_rpm_wilcox %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+             caption = "Wilcoxon rank-sum test: overall AMR burden (total RPM) Post-EVI vs Post-ASC")
+
+p_total_rpm <- ggplot(total_rpm,
+                      aes(x = sample_type, y = rpm, fill = sample_type)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.1, size = 2.5, alpha = 0.8, aes(colour = sample_type)) +
+  geom_text(data = total_rpm_wilcox,
+            aes(x = 1.5, y = Inf, label = paste0("p = ", round(p_value, 3),
+                                                   "  ", sig)),
+            vjust = 1.5, size = 4, fontface = "italic", inherit.aes = FALSE) +
+  facet_wrap(~ enrich_method) +
+  scale_fill_manual(values   = type_colours, guide = "none") +
+  scale_colour_manual(values = type_colours, guide = "none") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Total AMR Gene Hits per Million Reads (RPM) per Sample (Contigs)",
+       subtitle = "Wilcoxon rank-sum test",
+       x = NULL, y = "Total Hits per Million Reads") +
+  pub_theme
+
+print(p_total_rpm)
+save_gg(p_total_rpm, "stats_total_rpm_boxplot.png", w = 10, h = 5)
+```
+
+## Unique Gene Diversity (UGPMR): Post-EVI vs Post-ASC
+
+```{r stats-ugpmr, fig.height=9, fig.width=11}
+ugpmr_per_sample <- all_combined_rpm %>%
+  group_by(enrich_method, sample_type, sample_id, filtered_reads, database) %>%
+  summarise(n_unique = n_distinct(GENE), .groups = "drop") %>%
+  mutate(ugpmr         = n_unique / filtered_reads * 1e6,
+         database_label = recode(database, !!!db_labels))
+
+ugpmr_wilcox <- ugpmr_per_sample %>%
+  group_by(enrich_method, database_label) %>%
+  summarise(
+    p_value        = wilcox.test(ugpmr[sample_type == "Post-EVI"],
+                                 ugpmr[sample_type == "Post-ASC"],
+                                 exact = FALSE)$p.value,
+    median_PostEVI = median(ugpmr[sample_type == "Post-EVI"]),
+    median_PostASC = median(ugpmr[sample_type == "Post-ASC"]),
+    .groups        = "drop"
+  ) %>%
+  mutate(sig = case_when(p_value < 0.001 ~ "***",
+                         p_value < 0.01  ~ "**",
+                         p_value < 0.05  ~ "*",
+                         TRUE            ~ "ns"))
+
+knitr::kable(ugpmr_wilcox %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+             caption = "Wilcoxon rank-sum test: unique AMR genes per million reads (UGPMR), Post-EVI vs Post-ASC")
+
+p_ugpmr_box <- ggplot(ugpmr_per_sample,
+                      aes(x = sample_type, y = ugpmr, fill = sample_type)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.1, size = 2.5, alpha = 0.8,
+              aes(colour = sample_type)) +
+  geom_text(data = ugpmr_wilcox,
+            aes(x = 1.5, y = Inf,
+                label = paste0("p = ", round(p_value, 3), "  ", sig)),
+            vjust = 1.5, size = 3.8, fontface = "italic", inherit.aes = FALSE) +
+  facet_grid(database_label ~ enrich_method) +
+  scale_fill_manual(values = type_colours, guide = "none") +
+  scale_colour_manual(values = type_colours, guide = "none") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Unique AMR Genes per Million Reads (UGPMR): Post-EVI vs Post-ASC (Contigs)",
+       subtitle = "Wilcoxon rank-sum test; each point = one replicate",
+       x = NULL, y = "Unique Genes per Million Reads") +
+  pub_theme
+
+print(p_ugpmr_box)
+save_gg(p_ugpmr_box, "stats_ugpmr_boxplot.png", w = 11, h = 9)
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

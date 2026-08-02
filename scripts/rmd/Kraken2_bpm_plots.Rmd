@@ -1,0 +1,2047 @@
+---
+title: "Read Level Normalised Bacterial Diversity - Chapter 3"
+output: html_notebook
+---
+
+- EVI vs ASC samples 
+
+*Sample normalisation:*
+- Bases per million reads = (bases assigned to taxon / total bases in sample) × 1,000,000
+- Then presented as relative abundance of classified samples
+
+```{r Install packages}
+
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(vegan)
+library(gridExtra)
+library(ggtext)
+
+```
+
+```{r Label data}
+# Enrichment type labels 
+
+enrichment_labels <- c(
+  "No enrichment"        = "No enrichment",
+  "BPW then RVS enrichment" = "BPW then RVS enrichment",
+  "BF Bolton Base + CAT" = "BF Bolton Base + CAT"
+)
+
+# Sample labels 
+
+sample_labels <- c(
+  "CH01_ASC"      = "CH01",
+  "CH02_ASC"      = "CH02",
+  "CH03_ASC"      = "CH03",
+  "CH04_ASC"      = "CH04",
+  "CH05_ASC"      = "CH05",
+  "CH06_ASC"      = "CH06",
+  "CH01_ASC_RVS"  = "CH01",
+  "CH02_ASC_RVS"  = "CH02",
+  "CH03_ASC_RVS"  = "CH03",
+  "CH04_ASC_RVS"  = "CH04",
+  "CH05_ASC_RVS"  = "CH05",
+  "CH06_ASC_RVS"  = "CH06",
+  "CH01_ASC_BFBB" = "CH01",
+  "CH02_ASC_BFBB" = "CH02",
+  "CH03_ASC_BFBB" = "CH03",
+  "CH04_ASC_BFBB" = "CH04",
+  "CH05_ASC_BFBB" = "CH05",
+  "CH06_ASC_BFBB" = "CH06",
+  "CH01_EVI"      = "CH01",
+  "CH02_EVI"      = "CH02",
+  "CH03_EVI"      = "CH03",
+  "CH04_EVI"      = "CH04",
+  "CH05_EVI"      = "CH05",
+  "CH06_EVI"      = "CH06",
+  "CH01_EVI_RVS"  = "CH01",
+  "CH02_EVI_RVS"  = "CH02",
+  "CH03_EVI_RVS"  = "CH03",
+  "CH04_EVI_RVS"  = "CH04",
+  "CH05_EVI_RVS"  = "CH05",
+  "CH06_EVI_RVS"  = "CH06",
+  "CH01_EVI_BFBB" = "CH01",
+  "CH02_EVI_BFBB" = "CH02",
+  "CH03_EVI_BFBB" = "CH03",
+  "CH04_EVI_BFBB" = "CH04",
+  "CH05_EVI_BFBB" = "CH05",
+  "CH06_EVI_BFBB" = "CH06"
+)
+
+```
+
+
+```{r Data import and set-up}
+
+bpm_file <- "/Volumes/Alice/2_POULTRY_PROCESSING/Analysis/all_samples_bpm.tsv"
+out_dir  <- "/Volumes/Alice/2_POULTRY_PROCESSING/Analysis/figures_read"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Map group -> enrichment type
+enrich_map <- c(
+  "ASC"      = "No enrichment",
+  "EVI"      = "No enrichment",
+  "ASC_RVS"  = "BPW then RVS enrichment",
+  "EVI_RVS"  = "BPW then RVS enrichment",
+  "ASC_BFBB" = "BF Bolton Base + CAT",
+  "EVI_BFBB" = "BF Bolton Base + CAT"
+)
+
+add_factors <- function(d) {
+  d %>% mutate(
+    group           = factor(group, levels = c("ASC", "ASC_RVS", "ASC_BFBB",
+                                               "EVI", "EVI_RVS", "EVI_BFBB")),
+    enrichment_type = factor(enrich_map[as.character(group)],
+                             levels = names(enrichment_labels)),
+    sample_label    = factor(sample_labels[sample],
+                             levels = unique(sample_labels[unique(sample[order(group, sample)])]))
+  )
+}
+
+# Full dataset (all superkingdoms) - used for the host proportion chart
+df_raw <- read.delim(bpm_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE) %>%
+  add_factors()
+
+# Bacteria-only dataset - used for all composition plots
+# If superkingdom column is present (requires re-running kraken2_bpm.py), filter by it.
+# Otherwise fall back to name-based exclusion of known eukaryotes.
+if ("superkingdom" %in% names(df_raw)) {
+  df <- df_raw %>% filter(superkingdom == "Bacteria")
+} else {
+  message("NOTE: 'superkingdom' column not found in TSV. ",
+          "Re-run kraken2_bpm.py to enable automatic eukaryote filtering. ",
+          "Using name-based fallback filter for now.")
+  df <- df_raw %>%
+    filter(!grepl(paste0("^Homo|Hominidae|Homininae|Hominini|Primates|",
+                         "^Gallus|Phasianidae|Galliformes|Aves|",
+                         "^Meleagris|^Sus |^Bos |^Felis|^Canis"),
+                  taxon))
+}
+
+# Per-sample totals (denominators for classified/unclassified chart)
+# Drawn from df_raw so total_bases reflects all sequenced bases
+sample_totals <- df_raw %>%
+  filter(tax_level == "genus") %>%
+  group_by(enrichment_type, group, sample, sample_label) %>%
+  summarise(
+    total_bases      = first(total_bases),
+    classified_bases = first(classified_bases),
+    .groups = "drop"
+  )
+
+palette_bar <- c("#1F78B4", "#33A02C", "#E31A1C", "#FF7F00",
+                 "#6A3D9A", "#B15928", "#A6CEE3", "#B2DF8A",
+                 "#FB9A99", "#FDBF6F", "#CAB2D6", "#FFFF99")
+
+```
+
+
+```{r Plots}
+
+tax_level_labels <- c(genus = "Genus", family = "Family", species = "Species")
+
+for (tax_lvl in c("genus", "family", "species")) {
+for (enrich in levels(df$enrichment_type)) {
+
+  enrich_df <- df %>% filter(enrichment_type == enrich, tax_level == tax_lvl)
+
+  # Skip if no data for this combination
+  if (nrow(enrich_df) == 0) {
+    message("Skipping (no data): ", enrich, " | ", tax_lvl)
+    next
+  }
+
+  evi_samples <- sort(unique(enrich_df$sample[grepl("^EVI", as.character(enrich_df$group))]))
+  asc_samples <- sort(unique(enrich_df$sample[grepl("^ASC", as.character(enrich_df$group))]))
+  ordered_labels <- unique(sample_labels[c(evi_samples, asc_samples)])
+
+  enrich_df <- enrich_df %>%
+    mutate(
+      sample_label = factor(sample_labels[sample], levels = ordered_labels),
+      sample_type  = factor(if_else(grepl("^EVI", as.character(group)), "Post-EVI", "Post-ASC"),
+                            levels = c("Post-EVI", "Post-ASC"))
+    ) %>%
+    droplevels()
+
+  # Skip if sample_type has no levels after droplevels (all filtered out)
+  if (nlevels(enrich_df$sample_type) == 0 || nrow(enrich_df) == 0) {
+    message("Skipping (empty after filter): ", enrich, " | ", tax_lvl)
+    next
+  }
+
+  enrich_label <- enrichment_labels[enrich]
+  lvl_label    <- tax_level_labels[tax_lvl]
+  lvl_plural   <- c(genus = "genera", family = "families", species = "species")[tax_lvl]
+  file_slug    <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+
+  # Top 12 taxa for this enrichment type × taxonomic level
+  top12 <- enrich_df %>%
+    group_by(taxon) %>%
+    summarise(mean_ra = mean(rel_abund), .groups = "drop") %>%
+    slice_max(mean_ra, n = 12) %>%
+    arrange(desc(mean_ra)) %>%
+    pull(taxon)
+
+  stack_colours <- c(setNames(palette_bar, top12), "Other" = "#CCCCCC")
+
+  # Stacked bar
+  other_df <- enrich_df %>%
+    group_by(group, sample, sample_label) %>%
+    summarise(
+      rel_abund = 100 - sum(rel_abund[taxon %in% top12]),
+      .groups   = "drop"
+    ) %>%
+    mutate(taxon = "Other")
+
+  sample_type_map <- enrich_df %>% distinct(sample, sample_type)
+
+  stack_df <- enrich_df %>%
+    filter(taxon %in% top12) %>%
+    select(group, sample, sample_label, sample_type, taxon, rel_abund) %>%
+    bind_rows(other_df %>% left_join(sample_type_map, by = "sample")) %>%
+    mutate(taxon = fct_reorder(taxon, rel_abund, .fun = mean))
+
+  p_stack <- ggplot(stack_df, aes(x = sample_label, y = rel_abund, fill = taxon)) +
+    geom_col(width = 0.7, colour = "white", linewidth = 0.3) +
+    scale_fill_manual(values = stack_colours,
+                      labels = function(b) ifelse(b == "Other", b, paste0("*", b, "*"))) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"),
+                       expand = expansion(mult = c(0, 0.02))) +
+    facet_grid(. ~ sample_type, scales = "free_x", space = "free_x") +
+    labs(
+      title    = paste0(enrich_label, " - ", lvl_label, " level"),
+      subtitle = paste0("Top 12 ", lvl_plural, " by mean relative abundance"),
+      x        = NULL,
+      y        = "Relative abundance (% of classified bases)",
+      fill     = lvl_label
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10, colour = "grey40"),
+      axis.text.x   = element_text(angle = 45, hjust = 1),
+      legend.text   = element_markdown(size = 12),
+      strip.text    = element_text(face = "bold", size = 12),
+      panel.spacing = unit(0.8, "lines")
+    )
+
+  # Classified vs Unclassified (same for all tax levels - use genus-level totals)
+  class_df <- sample_totals %>%
+    filter(enrichment_type == enrich) %>%
+    left_join(enrich_df %>% distinct(sample, sample_type), by = "sample") %>%
+    filter(!is.na(sample_type)) %>%   # drop samples absent from enrich_df
+    mutate(
+      sample_label = factor(sample_labels[sample], levels = levels(enrich_df$sample_label)),
+      Classified   = classified_bases / total_bases * 100,
+      Unclassified = 100 - Classified
+    ) %>%
+    pivot_longer(cols = c(Classified, Unclassified),
+                 names_to = "status", values_to = "pct")
+
+  p_class <- ggplot(class_df, aes(x = sample_label, y = pct, fill = status)) +
+    geom_col(width = 0.6, colour = "white", linewidth = 0.4) +
+    scale_fill_manual(values = c("Classified" = "#1F78B4", "Unclassified" = "#B2DF8A")) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"),
+                       expand = expansion(mult = c(0, 0.02))) +
+    facet_grid(. ~ sample_type, scales = "free_x", space = "free_x") +
+    labs(
+      title = NULL,
+      x     = NULL,
+      y     = "% of total bases",
+      fill  = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      axis.text.x   = element_text(angle = 45, hjust = 1),
+      strip.text    = element_text(face = "bold", size = 12),
+      panel.spacing = unit(0.8, "lines")
+    )
+
+  # Combined panel
+  p_combined <- p_stack / p_class +
+    plot_layout(heights = c(2, 1))
+
+  fname <- file.path(out_dir, paste0(file_slug, "_bpm_combined.png"))
+  ggsave(fname, p_combined, width = 12, height = 10, dpi = 600)
+  message("Saved: ", basename(fname))
+
+  fname2 <- file.path(out_dir, paste0(file_slug, "_bpm_stacked.png"))
+  ggsave(fname2, p_stack, width = 10, height = 7, dpi = 600)
+  message("Saved: ", basename(fname2))
+
+  # Extra plot for no-enrichment group only: heatmap of top 20 taxa
+  if (enrich == "No enrichment") {
+
+    # Top 20 taxa ordered ascending so the highest-abundance taxon sits at top of y-axis
+    top20 <- enrich_df %>%
+      group_by(taxon) %>%
+      summarise(mean_ra = mean(rel_abund), .groups = "drop") %>%
+      slice_max(mean_ra, n = 20, with_ties = FALSE) %>%
+      arrange(mean_ra) %>%
+      pull(taxon)
+
+    sample_meta20 <- enrich_df %>% distinct(sample, sample_label, sample_type)
+
+    grid20 <- expand.grid(
+      taxon  = top20,
+      sample = unique(enrich_df$sample),
+      stringsAsFactors = FALSE
+    ) %>%
+      left_join(enrich_df %>% filter(taxon %in% top20) %>%
+                  select(sample, taxon, rel_abund),
+                by = c("taxon", "sample")) %>%
+      left_join(sample_meta20, by = "sample") %>%
+      mutate(
+        rel_abund    = replace_na(rel_abund, 0),
+        rel_plot     = ifelse(rel_abund > 0, rel_abund, NA_real_),
+        taxon        = factor(taxon, levels = top20),
+        sample_label = factor(as.character(sample_label),
+                              levels = levels(enrich_df$sample_label))
+      )
+
+    p_heat <- ggplot(grid20, aes(x = sample_label, y = taxon, fill = rel_plot)) +
+      geom_tile(colour = "white", linewidth = 0.6) +
+      scale_fill_gradient(
+        low      = "#D9F0E3",
+        high     = "#00441B",
+        trans    = "log10",
+        labels   = function(x) paste0(x, "%"),
+        na.value = "#EEEEEE",
+        name     = "Rel. abundance\n(% of classified bases)"
+      ) +
+      scale_y_discrete(expand = expansion(add = 0.5)) +
+      facet_grid(. ~ sample_type, scales = "free_x", space = "free_x") +
+      labs(
+        title    = paste0(enrich_label, " - Top 20 ", lvl_plural,
+                          " by mean relative abundance (", lvl_label, " level)"),
+        subtitle = "Colour intensity = relative abundance (% of classified bases); grey = not detected",
+        x        = NULL,
+        y        = NULL
+      ) +
+      theme_light(base_size = 13) +
+      theme(
+        axis.text.x     = element_text(angle = 30, hjust = 1, size = 11),
+        axis.text.y     = element_text(size = 10, face = "italic"),
+        plot.title      = element_text(face = "bold", size = 13),
+        plot.subtitle   = element_text(size = 10, colour = "grey40"),
+        strip.text      = element_text(face = "bold", size = 12),
+        panel.spacing   = unit(0.8, "lines"),
+        legend.position = "right",
+        panel.grid      = element_blank()
+      )
+
+    fname3 <- file.path(out_dir, paste0("No_enrichment_bpm_top20_heatmap_", tax_lvl, ".png"))
+    ggsave(fname3, p_heat, width = 12, height = 8, dpi = 600)
+    message("Saved: ", basename(fname3))
+  }
+
+} # end enrich loop
+} # end tax_lvl loop
+
+message("\nAll done. Figures saved to: ", out_dir)
+
+```
+
+
+```{r Option 2 - threshold-based stacked bars}
+
+# Option 2: show all taxa with mean rel_abund >= threshold; collapse rest into "Other"
+# Adjust threshold_pct to taste (1 = 1%)
+threshold_pct <- 1
+
+for (tax_lvl in c("genus", "family", "species")) {
+for (enrich in levels(df$enrichment_type)) {
+
+  enrich_df <- df %>% filter(enrichment_type == enrich, tax_level == tax_lvl)
+  if (nrow(enrich_df) == 0) next
+
+  evi_samples    <- sort(unique(enrich_df$sample[grepl("^EVI", as.character(enrich_df$group))]))
+  asc_samples    <- sort(unique(enrich_df$sample[grepl("^ASC", as.character(enrich_df$group))]))
+  ordered_labels <- unique(sample_labels[c(evi_samples, asc_samples)])
+
+  enrich_df <- enrich_df %>%
+    mutate(
+      sample_label = factor(sample_labels[sample], levels = ordered_labels),
+      sample_type  = factor(if_else(grepl("^EVI", as.character(group)), "Post-EVI", "Post-ASC"),
+                            levels = c("Post-EVI", "Post-ASC"))
+    ) %>%
+    droplevels()
+
+  if (nlevels(enrich_df$sample_type) == 0 || nrow(enrich_df) == 0) next
+
+  enrich_label <- enrichment_labels[enrich]
+  lvl_label    <- tax_level_labels[tax_lvl]
+  lvl_plural   <- c(genus = "genera", family = "families", species = "species")[tax_lvl]
+  file_slug    <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+
+  # Select taxa that exceed the threshold on average
+  above_thresh <- enrich_df %>%
+    group_by(taxon) %>%
+    summarise(mean_ra = mean(rel_abund), .groups = "drop") %>%
+    filter(mean_ra >= threshold_pct) %>%
+    arrange(desc(mean_ra)) %>%
+    pull(taxon)
+
+  n_above       <- length(above_thresh)
+  palette_thr   <- colorRampPalette(palette_bar)(max(n_above, 1))
+  thresh_colours <- c(setNames(palette_thr, above_thresh), "Other" = "#CCCCCC")
+
+  sample_type_map <- enrich_df %>% distinct(sample, sample_type)
+
+  other_thr_df <- enrich_df %>%
+    group_by(group, sample, sample_label) %>%
+    summarise(
+      rel_abund = 100 - sum(rel_abund[taxon %in% above_thresh]),
+      .groups   = "drop"
+    ) %>%
+    mutate(taxon = "Other")
+
+  stack_thr_df <- enrich_df %>%
+    filter(taxon %in% above_thresh) %>%
+    select(group, sample, sample_label, sample_type, taxon, rel_abund) %>%
+    bind_rows(other_thr_df %>% left_join(sample_type_map, by = "sample")) %>%
+    mutate(taxon = fct_reorder(taxon, rel_abund, .fun = mean))
+
+  p_thresh <- ggplot(stack_thr_df, aes(x = sample_label, y = rel_abund, fill = taxon)) +
+    geom_col(width = 0.7, colour = "white", linewidth = 0.3) +
+    scale_fill_manual(values = thresh_colours,
+                      labels = function(b) ifelse(b == "Other", b, paste0("*", b, "*"))) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"),
+                       expand = expansion(mult = c(0, 0.02))) +
+    facet_grid(. ~ sample_type, scales = "free_x", space = "free_x") +
+    labs(
+      title    = paste0(enrich_label, " - ", lvl_label, " level"),
+      subtitle = paste0(n_above, " ", lvl_plural, " with mean relative abundance ≥ ",
+                        threshold_pct, "% shown individually"),
+      x        = NULL,
+      y        = "Relative abundance (% of classified bases)",
+      fill     = lvl_label
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10, colour = "grey40"),
+      axis.text.x   = element_text(angle = 45, hjust = 1),
+      legend.text   = element_markdown(size = 10),
+      strip.text    = element_text(face = "bold", size = 12),
+      panel.spacing = unit(0.8, "lines")
+    )
+
+  fname_thr <- file.path(out_dir, paste0(file_slug, "_threshold_bpm_stacked.png"))
+  ggsave(fname_thr, p_thresh, width = 10, height = 7, dpi = 600)
+  message("Saved: ", basename(fname_thr))
+
+} # end enrich loop
+} # end tax_lvl loop
+
+message("\nAll done. Option 2 (", threshold_pct, "% threshold) figures saved to: ", out_dir)
+# Note: Option 3 (unfiltered all-taxa) is already generated above for the No enrichment group only.
+
+```
+
+
+---
+
+# *Klebsiella pneumoniae* relative abundance - BPW then RVS enrichment
+
+Paired plot showing *Klebsiella pneumoniae* relative abundance in Post-EVI vs Post-ASC samples enriched with BPW then RVS. Each line connects the matched pair from the same chicken (CH01–CH06).
+
+```{r Klebsiella pneumoniae BPW+RVS, fig.height=8, fig.width=6}
+
+kp_taxon  <- "Klebsiella pneumoniae"   # species-level name in Kraken2 output
+kp_enrich <- "BPW then RVS enrichment"
+
+# Try species level first; fall back to genus if species not found
+kp_df_sp <- df %>%
+  filter(enrichment_type == kp_enrich,
+         tax_level       == "species",
+         taxon           == kp_taxon)
+
+kp_df_ge <- df %>%
+  filter(enrichment_type == kp_enrich,
+         tax_level       == "genus",
+         taxon           == "Klebsiella")
+
+if (nrow(kp_df_sp) > 0) {
+  kp_df     <- kp_df_sp
+  kp_label  <- kp_taxon
+  kp_lvl    <- "species"
+} else if (nrow(kp_df_ge) > 0) {
+  message("NOTE: '", kp_taxon, "' not found at species level; using genus 'Klebsiella'.")
+  kp_df     <- kp_df_ge
+  kp_label  <- "Klebsiella (genus)"
+  kp_lvl    <- "genus"
+} else {
+  message("WARNING: ", kp_taxon, " not found in BPW then RVS data at species or genus level.")
+  kp_df <- NULL
+}
+
+if (!is.null(kp_df) && nrow(kp_df) > 0) {
+
+  kp_plot_df <- kp_df %>%
+    mutate(
+      sample_type  = factor(if_else(grepl("^EVI", as.character(group)),
+                                    "Post-EVI", "Post-ASC"),
+                            levels = c("Post-EVI", "Post-ASC")),
+      chicken_id   = sub("^CH(\\d+)_.*", "CH\\1", sample)
+    ) %>%
+    select(sample, chicken_id, sample_type, rel_abund)
+
+  # Wilcoxon test
+  evi_vals <- kp_plot_df$rel_abund[kp_plot_df$sample_type == "Post-EVI"]
+  asc_vals <- kp_plot_df$rel_abund[kp_plot_df$sample_type == "Post-ASC"]
+  wx <- tryCatch(
+    wilcox.test(evi_vals, asc_vals, paired = TRUE, exact = FALSE),
+    error = function(e) NULL
+  )
+  p_label <- if (!is.null(wx)) {
+    pv <- wx$p.value
+    if (pv < 0.001) "paired Wilcoxon: ***" else if (pv < 0.01) "paired Wilcoxon: **" else
+    if (pv < 0.05)  "paired Wilcoxon: *"   else paste0("paired Wilcoxon: p = ", round(pv, 3))
+  } else ""
+
+  p_kp <- ggplot(kp_plot_df, aes(x = sample_type, y = rel_abund)) +
+    geom_jitter(aes(colour = sample_type), size = 3.5, alpha = 0.9, position = position_jitter(width = 0.05, height = 0, seed = 42)) +
+    scale_colour_manual(values = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C")) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"),
+                       limits = c(0, NA),
+                       expand = expansion(mult = c(0.02, 0.1))) +
+    labs(
+      title    = paste0("<b><i>", kp_label, "</i></b> - BPW then RVS enrichment"),
+      subtitle = paste0("Relative abundance (% of classified bases)  ", p_label),
+      x        = NULL,
+      y        = "Relative abundance (%)",
+      colour   = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title      = element_markdown(size = 13),
+      plot.subtitle   = element_text(size = 10, colour = "grey40"),
+      axis.text.x     = element_text(size = 12),
+      legend.position = "none"
+    )
+
+  # Log10 version - add small pseudocount so zero values are visible
+  pseudocount <- 0.01
+  p_kp_log <- p_kp +
+    scale_y_log10(labels = function(x) paste0(x, "%"),
+                  expand = expansion(mult = c(0.05, 0.1))) +
+    geom_jitter(data = kp_plot_df %>% mutate(rel_abund = rel_abund + pseudocount),
+                aes(colour = sample_type), width = 0.05, height = 0,
+                size = 3.5, alpha = 0.9, seed = 42) +
+    labs(subtitle = paste0("Log10 scale (+ ", pseudocount, "% pseudocount)  ", p_label))
+
+  kp_table <- kp_plot_df %>%
+    arrange(sample_type, chicken_id) %>%
+    select(chicken_id, sample_type, rel_abund) %>%
+    mutate(rel_abund = round(rel_abund, 4)) %>%
+    rename(`Chicken` = chicken_id, `Group` = sample_type, `Rel. abundance (%)` = rel_abund)
+  print(kp_table)
+
+  print(p_kp)
+  print(p_kp_log)
+
+  kp_fname <- file.path(out_dir, paste0("Klebsiella_pneumoniae_BPW_RVS_", kp_lvl, ".png"))
+  ggsave(kp_fname, p_kp, width = 6, height = 8, dpi = 600)
+  message("Saved: ", basename(kp_fname))
+
+  kp_fname_log <- file.path(out_dir, paste0("Klebsiella_pneumoniae_BPW_RVS_", kp_lvl, "_log10.png"))
+  ggsave(kp_fname_log, p_kp_log, width = 6, height = 8, dpi = 600)
+  message("Saved: ", basename(kp_fname_log))
+}
+
+```
+
+
+---
+
+# *Salmonella enterica* Relative Abundance - All Enrichment Types
+
+Boxplot with individual sample points (Post-EVI vs Post-ASC, unpaired) showing *Salmonella enterica* relative abundance across all enrichment types, including non-enriched samples. Samples with no detected reads shown as zero.
+
+```{r Salmonella enterica all enrichments, fig.height=6, fig.width=10}
+
+se_taxon <- "Salmonella enterica"
+
+# Try species level first; fall back to genus
+se_df_sp <- df %>%
+  filter(tax_level == "species", taxon == se_taxon)
+
+se_df_ge <- df %>%
+  filter(tax_level == "genus", taxon == "Salmonella")
+
+if (nrow(se_df_sp) > 0) {
+  se_df    <- se_df_sp
+  se_label <- se_taxon
+  se_lvl   <- "species"
+} else if (nrow(se_df_ge) > 0) {
+  message("NOTE: '", se_taxon, "' not found at species level; using genus 'Salmonella'.")
+  se_df    <- se_df_ge
+  se_label <- "Salmonella (genus)"
+  se_lvl   <- "genus"
+} else {
+  message("WARNING: ", se_taxon, " not found in data at species or genus level.")
+  se_df <- NULL
+}
+
+if (!is.null(se_df) && nrow(se_df) > 0) {
+
+  # Build complete sample scaffold so samples with 0 reads still appear
+  all_samples_se <- df %>%
+    filter(tax_level == "species") %>%
+    distinct(group, sample, enrichment_type)
+
+  se_plot_df <- all_samples_se %>%
+    left_join(se_df %>% select(sample, rel_abund),
+              by = "sample") %>%
+    replace_na(list(rel_abund = 0)) %>%
+    mutate(
+      sample_type  = factor(if_else(grepl("^EVI", as.character(group)),
+                                    "Post-EVI", "Post-ASC"),
+                            levels = c("Post-EVI", "Post-ASC")),
+      enrich_label = factor(enrichment_labels[as.character(enrichment_type)],
+                            levels = unname(enrichment_labels))
+    )
+
+  se_detect_df <- se_plot_df %>% filter(rel_abund > 0)
+
+  p_se <- ggplot(se_detect_df,
+                 aes(x = sample_type, y = rel_abund, colour = sample_type, fill = sample_type)) +
+    geom_boxplot(width = 0.45, alpha = 0.3, outlier.shape = NA, colour = "grey30") +
+    geom_jitter(size = 3, alpha = 0.85, position = position_jitter(width = 0.1, height = 0, seed = 42)) +
+    scale_colour_manual(values = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"),
+                        drop = FALSE) +
+    scale_fill_manual(values   = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"),
+                      drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"),
+                       limits = c(0, NA),
+                       expand = expansion(mult = c(0.02, 0.08))) +
+    facet_wrap(~ enrich_label, nrow = 1) +
+    labs(
+      title    = paste0("<b><i>", se_label, "</i></b> - relative abundance by sample type"),
+      subtitle = "Relative abundance (% of classified bases). Data points absent where taxon not detected in sample.",
+      x        = NULL,
+      y        = "Relative abundance (%)",
+      colour   = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title      = element_markdown(size = 13),
+      plot.subtitle   = element_text(size = 10, colour = "grey40"),
+      axis.text.x     = element_text(size = 12),
+      strip.text      = element_text(face = "bold", size = 11),
+      panel.spacing   = unit(0.8, "lines"),
+      legend.position = "none"
+    )
+
+  print(p_se)
+
+  se_fname <- file.path(out_dir, paste0("Salmonella_enterica_all_enrichments_",
+                                        se_lvl, ".png"))
+  ggsave(se_fname, p_se, width = 10, height = 6, dpi = 600)
+  message("Saved: ", basename(se_fname))
+
+  # Log10 version - only detected samples, pseudocount added for log scale
+  pseudocount <- 0.01
+  se_log_df <- se_detect_df %>% mutate(rel_abund = rel_abund + pseudocount)
+  p_se_log <- ggplot(se_log_df,
+                     aes(x = sample_type, y = rel_abund,
+                         colour = sample_type, fill = sample_type)) +
+    geom_boxplot(width = 0.45, alpha = 0.3, outlier.shape = NA, colour = "grey30") +
+    geom_jitter(size = 3, alpha = 0.85, position = position_jitter(width = 0.1, height = 0, seed = 42)) +
+    scale_colour_manual(values = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"),
+                        drop = FALSE) +
+    scale_fill_manual(values   = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"),
+                      drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_log10(labels = function(x) paste0(x, "%"),
+                  expand = expansion(mult = c(0.05, 0.08))) +
+    facet_wrap(~ enrich_label, nrow = 1) +
+    labs(
+      title    = paste0("<b><i>", se_label, "</i></b> - relative abundance by sample type"),
+      subtitle = paste0("Log10 scale (+ ", pseudocount,
+                        "% pseudocount). Data points absent where taxon not detected in sample."),
+      x = NULL, y = "Relative abundance (%)", colour = NULL, fill = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title      = element_markdown(size = 13),
+      plot.subtitle   = element_text(size = 10, colour = "grey40"),
+      axis.text.x     = element_text(size = 12),
+      strip.text      = element_text(face = "bold", size = 11),
+      panel.spacing   = unit(0.8, "lines"),
+      legend.position = "none"
+    )
+
+  print(p_se_log)
+
+  se_fname_log <- file.path(out_dir, paste0("Salmonella_enterica_all_enrichments_",
+                                             se_lvl, "_log10.png"))
+  ggsave(se_fname_log, p_se_log, width = 10, height = 6, dpi = 600)
+  message("Saved: ", basename(se_fname_log))
+
+  # Per-sample relative abundance table
+  se_table <- se_plot_df %>%
+    mutate(
+      Sample      = sample_labels[sample],
+      `Sample type` = as.character(sample_type),
+      Enrichment  = as.character(enrich_label),
+      `Relative abundance (%)` = ifelse(rel_abund == 0, "Not detected",
+                                         paste0(round(rel_abund, 4), "%"))
+    ) %>%
+    arrange(enrich_label, sample_type, Sample) %>%
+    select(Enrichment, `Sample type`, Sample, `Relative abundance (%)`)
+
+  print(knitr::kable(se_table,
+                     caption = paste0("*", se_label, "* - relative abundance per sample (read-level)"),
+                     align   = c("l", "l", "l", "r")))
+
+} else {
+  message("No Salmonella data found - skipping figure.")
+}
+
+```
+
+
+---
+
+# *Campylobacter* Relative Abundance - All Enrichment Types
+
+Boxplot with individual sample points (Post-EVI vs Post-ASC, unpaired) showing *Campylobacter* relative abundance at genus level across all enrichment types. Mean relative abundance per group is printed in the summary table. Samples with no detected reads are shown as zero.
+
+```{r Campylobacter genus all enrichments, fig.height=6, fig.width=10}
+
+camp_taxon <- "Campylobacter"
+
+camp_df <- df %>%
+  filter(tax_level == "genus", taxon == camp_taxon)
+
+if (nrow(camp_df) > 0) {
+
+  # Complete scaffold so samples with 0 reads still appear
+  all_samples_camp <- df %>%
+    filter(tax_level == "genus") %>%
+    distinct(group, sample, enrichment_type)
+
+  camp_plot_df <- all_samples_camp %>%
+    left_join(camp_df %>% select(sample, rel_abund), by = "sample") %>%
+    replace_na(list(rel_abund = 0)) %>%
+    mutate(
+      sample_type  = factor(if_else(grepl("^EVI", as.character(group)),
+                                    "Post-EVI", "Post-ASC"),
+                            levels = c("Post-EVI", "Post-ASC")),
+      enrich_label = factor(enrichment_labels[as.character(enrichment_type)],
+                            levels = unname(enrichment_labels))
+    )
+
+  # Mean relative abundance summary table (wide format)
+  camp_summary <- camp_plot_df %>%
+    group_by(enrich_label, sample_type) %>%
+    summarise(mean_rel_abund = round(mean(rel_abund), 4), .groups = "drop") %>%
+    pivot_wider(names_from = sample_type, values_from = mean_rel_abund) %>%
+    rename(Enrichment = enrich_label)
+
+  print(knitr::kable(camp_summary,
+                     caption = paste0("*", camp_taxon, "* (genus) - mean relative abundance (%) across six samples per group"),
+                     col.names = c("Enrichment", "Post-EVI mean (%)", "Post-ASC mean (%)"),
+                     align     = c("l", "r", "r")))
+
+  # Overall mean pooled across all enrichment types
+  camp_overall <- camp_plot_df %>%
+    group_by(sample_type) %>%
+    summarise(mean_rel_abund = round(mean(rel_abund), 4), .groups = "drop") %>%
+    pivot_wider(names_from = sample_type, values_from = mean_rel_abund)
+
+  print(knitr::kable(camp_overall,
+                     caption = paste0("*", camp_taxon, "* (genus) - overall mean relative abundance (%) pooled across all enrichment types"),
+                     col.names = c("Post-EVI mean (%)", "Post-ASC mean (%)"),
+                     align     = c("r", "r")))
+
+  # Detect samples only for boxplot (zero-reads shown if all samples zero)
+  camp_detect_df <- camp_plot_df
+
+  p_camp <- ggplot(camp_detect_df,
+                   aes(x = sample_type, y = rel_abund, colour = sample_type, fill = sample_type)) +
+    geom_boxplot(width = 0.45, alpha = 0.3, outlier.shape = NA, colour = "grey30") +
+    geom_jitter(size = 3, alpha = 0.85, position = position_jitter(width = 0.1, height = 0, seed = 42)) +
+    scale_colour_manual(values = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"), drop = FALSE) +
+    scale_fill_manual(values   = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"), drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"),
+                       limits = c(0, NA),
+                       expand = expansion(mult = c(0.02, 0.08))) +
+    facet_wrap(~ enrich_label, nrow = 1) +
+    labs(
+      title    = paste0("<b><i>", camp_taxon, "</i></b> (genus) - relative abundance by sample type"),
+      subtitle = "Relative abundance (% of classified bases). Samples with no detected reads shown as zero.",
+      x        = NULL,
+      y        = "Relative abundance (%)",
+      colour   = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title      = element_markdown(size = 13),
+      plot.subtitle   = element_text(size = 10, colour = "grey40"),
+      axis.text.x     = element_text(size = 12),
+      strip.text      = element_text(face = "bold", size = 11),
+      panel.spacing   = unit(0.8, "lines"),
+      legend.position = "none"
+    )
+
+  print(p_camp)
+
+  camp_fname <- file.path(out_dir, "Campylobacter_genus_all_enrichments.png")
+  ggsave(camp_fname, p_camp, width = 10, height = 6, dpi = 600)
+  message("Saved: ", basename(camp_fname))
+
+  # Log10 version
+  pseudocount <- 0.01
+  camp_log_df <- camp_detect_df %>% mutate(rel_abund = rel_abund + pseudocount)
+  p_camp_log <- ggplot(camp_log_df,
+                       aes(x = sample_type, y = rel_abund,
+                           colour = sample_type, fill = sample_type)) +
+    geom_boxplot(width = 0.45, alpha = 0.3, outlier.shape = NA, colour = "grey30") +
+    geom_jitter(size = 3, alpha = 0.85, position = position_jitter(width = 0.1, height = 0, seed = 42)) +
+    scale_colour_manual(values = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"), drop = FALSE) +
+    scale_fill_manual(values   = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C"), drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_log10(labels = function(x) paste0(x, "%"),
+                  expand = expansion(mult = c(0.05, 0.08))) +
+    facet_wrap(~ enrich_label, nrow = 1) +
+    labs(
+      title    = paste0("<b><i>", camp_taxon, "</i></b> (genus) - relative abundance by sample type"),
+      subtitle = paste0("Log10 scale (+ ", pseudocount, "% pseudocount)."),
+      x = NULL, y = "Relative abundance (%)", colour = NULL, fill = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title      = element_markdown(size = 13),
+      plot.subtitle   = element_text(size = 10, colour = "grey40"),
+      axis.text.x     = element_text(size = 12),
+      strip.text      = element_text(face = "bold", size = 11),
+      panel.spacing   = unit(0.8, "lines"),
+      legend.position = "none"
+    )
+
+  print(p_camp_log)
+
+  camp_fname_log <- file.path(out_dir, "Campylobacter_genus_all_enrichments_log10.png")
+  ggsave(camp_fname_log, p_camp_log, width = 10, height = 6, dpi = 600)
+  message("Saved: ", basename(camp_fname_log))
+
+} else {
+  message("No Campylobacter data found at genus level - skipping figure.")
+}
+
+```
+
+
+---
+
+# Top 10 Taxa by Relative Abundance — Per Sample Breakdown
+
+For each enrichment type and taxonomic level (genus and species), the top 10 taxa are selected by mean relative abundance across all samples in that group. Values are shown per individual sample, with mean relative abundance for Post-EVI and Post-ASC groups. TSV files are saved to `out_dir`.
+
+```{r Top 10 per-sample breakdown, results='asis'}
+
+for (tax_lvl in c("genus", "species")) {
+  for (enrich in levels(df$enrichment_type)) {
+
+    enrich_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(
+        sample_type  = if_else(grepl("^EVI", as.character(group)), "Post-EVI", "Post-ASC"),
+        sample_label = sample_labels[sample],
+        col_name     = paste0(if_else(sample_type == "Post-EVI", "EVI", "ASC"),
+                              " ", sample_label)
+      )
+
+    if (nrow(enrich_df) == 0) {
+      message("Skipping (no data): ", enrich, " | ", tax_lvl)
+      next
+    }
+
+    # Top 10 taxa by mean relative abundance across all samples in this enrichment type
+    top10 <- enrich_df %>%
+      group_by(taxon) %>%
+      summarise(mean_ra = mean(rel_abund), .groups = "drop") %>%
+      slice_max(mean_ra, n = 10, with_ties = FALSE) %>%
+      arrange(desc(mean_ra)) %>%
+      pull(taxon)
+
+    if (length(top10) == 0) next
+
+    top10_df <- enrich_df %>% filter(taxon %in% top10)
+
+    # Wide table: one row per taxon, one column per sample
+    per_sample <- top10_df %>%
+      select(taxon, col_name, rel_abund) %>%
+      pivot_wider(names_from = col_name, values_from = rel_abund, values_fill = 0) %>%
+      mutate(across(-taxon, ~ round(.x, 4)))
+
+    # Group means (Post-EVI and Post-ASC separately)
+    group_means <- top10_df %>%
+      group_by(taxon, sample_type) %>%
+      summarise(mean_ra = round(mean(rel_abund), 4), .groups = "drop") %>%
+      pivot_wider(names_from = sample_type, values_from = mean_ra, values_fill = 0)
+
+    if (!"Post-EVI" %in% names(group_means)) group_means[["Post-EVI"]] <- 0
+    if (!"Post-ASC" %in% names(group_means)) group_means[["Post-ASC"]] <- 0
+
+    group_means <- group_means %>%
+      rename(`Mean Post-EVI (%)` = `Post-EVI`,
+             `Mean Post-ASC (%)` = `Post-ASC`)
+
+    # Column order: EVI samples → ASC samples → group means
+    evi_cols <- sort(grep("^EVI ", names(per_sample), value = TRUE))
+    asc_cols <- sort(grep("^ASC ", names(per_sample), value = TRUE))
+
+    tbl <- per_sample %>%
+      left_join(group_means, by = "taxon") %>%
+      mutate(taxon = factor(taxon, levels = top10)) %>%
+      arrange(taxon) %>%
+      select(Taxon = taxon,
+             all_of(evi_cols),
+             all_of(asc_cols),
+             `Mean Post-EVI (%)`,
+             `Mean Post-ASC (%)`)
+
+    lvl_label  <- tax_level_labels[tax_lvl]
+    lvl_plural <- c(genus = "genera", family = "families", species = "species")[tax_lvl]
+    enrich_lbl <- enrichment_labels[enrich]
+    file_slug  <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+
+    cat("\n\n###", lvl_label, "level —", enrich_lbl, "\n\n")
+
+    print(knitr::kable(tbl,
+                       caption = paste0("Top 10 ", lvl_plural,
+                                        " by mean relative abundance (%) — ", enrich_lbl),
+                       digits  = 4,
+                       align   = c("l", rep("r", ncol(tbl) - 1))))
+
+    write.table(tbl,
+                file.path(out_dir, paste0("top10_", file_slug, "_per_sample.tsv")),
+                sep = "\t", row.names = FALSE, quote = FALSE)
+    message("Saved: top10_", file_slug, "_per_sample.tsv")
+  }
+}
+
+message("\nTop-10 per-sample breakdown tables done.")
+
+```
+
+
+---
+
+# *Campylobacter* spp., *Salmonella* spp. & *Escherichia* spp. - Species Relative Abundance Heatmap (Reads)
+
+Heatmap showing relative abundance of each species within each genus, per sample, by enrichment type. Tile colour intensity reflects relative abundance (% of classified bases); grey tiles indicate the species was not detected.
+
+```{r read_genus_heatmap_fn}
+
+plot_read_genus_heatmap <- function(spp_df, title, subtitle = NULL, save_path = NULL) {
+  if (nrow(spp_df) == 0) { message("No data — skipping."); return(invisible(NULL)) }
+
+  species_order <- spp_df %>%
+    group_by(name) %>%
+    summarise(m = mean(rel_abund, na.rm = TRUE), .groups = "drop") %>%
+    arrange(m) %>% pull(name)
+
+  sample_meta <- spp_df %>% distinct(sample, sample_label, sample_type)
+
+  grid <- expand.grid(name   = species_order,
+                      sample = unique(spp_df$sample),
+                      stringsAsFactors = FALSE) %>%
+    left_join(spp_df %>% select(sample, name, rel_abund), by = c("sample", "name")) %>%
+    left_join(sample_meta, by = "sample") %>%
+    mutate(
+      rel_abund    = replace_na(rel_abund, 0),
+      # Zero (not detected) is mapped to NA so it renders as a distinct grey tile
+      # rather than the bottom of the colour gradient
+      rel_plot     = ifelse(rel_abund > 0, rel_abund, NA_real_),
+      name         = factor(name, levels = species_order),
+      sample_label = factor(sample_label, levels = sort(unique(sample_meta$sample_label)))
+    )
+
+  # Wrap the title onto its own lines using an explicit break rather than
+  # relying on auto text-wrapping, which can overlap the subtitle below
+  title_wrapped <- gsub(" - ", "<br>", title)
+
+  p <- ggplot(grid, aes(x = sample_label, y = name, fill = rel_plot)) +
+    geom_tile(colour = "white", linewidth = 0.6) +
+    scale_fill_gradient(
+      low      = "#D9F0E3",
+      high     = "#00441B",
+      trans    = "log10",
+      labels   = function(x) paste0(x, "%"),
+      na.value = "#EEEEEE",
+      name     = "Rel. abundance\n(% of classified bases)"
+    ) +
+    scale_y_discrete(expand = expansion(add = 0.5)) +
+    facet_grid(. ~ sample_type, scales = "free_x", space = "free_x") +
+    labs(title = title_wrapped, subtitle = subtitle, x = NULL, y = NULL) +
+    theme_light(base_size = 13) +
+    theme(
+      axis.text.x     = element_text(angle = 30, hjust = 1, size = 11),
+      axis.text.y     = element_text(size = 10, face = "italic"),
+      plot.title      = element_markdown(face = "bold", size = 14, lineheight = 1.2,
+                                         margin = margin(b = 8)),
+      plot.subtitle   = element_text(size = 10, colour = "grey40", margin = margin(b = 4)),
+      plot.margin     = margin(t = 10, r = 10, b = 8, l = 10),
+      strip.text      = element_text(face = "bold", size = 12),
+      legend.position = "right",
+      panel.grid      = element_blank()
+    )
+
+  print(p)
+  if (!is.null(save_path)) ggsave(save_path, p, width = 10, height = 7, dpi = 600)
+  invisible(p)
+}
+
+```
+
+```{r pathogen_spp_heatmap_reads, fig.height=7, fig.width=12}
+
+pathogen_genera_read <- list(
+  list(genus = "Campylobacter", slug = "campylobacter"),
+  list(genus = "Salmonella",    slug = "salmonella"),
+  list(genus = "Escherichia",   slug = "escherichia")
+)
+
+for (pg in pathogen_genera_read) {
+
+  # Species detected anywhere for this genus — defines the y-axis for all enrichment plots
+  global_spp <- df %>%
+    filter(tax_level == "species",
+           str_detect(taxon, paste0("^", pg$genus)),
+           rel_abund > 0) %>%
+    pull(taxon) %>% unique()
+
+  if (length(global_spp) == 0) {
+    message("No ", pg$genus, " species detected in any sample — skipping.")
+    next
+  }
+
+  for (enrich in levels(df$enrichment_type)) {
+
+    spp_df <- df %>%
+      filter(tax_level == "species",
+             taxon %in% global_spp,
+             enrichment_type == enrich) %>%
+      mutate(
+        name         = taxon,
+        sample_type  = factor(if_else(grepl("^EVI", as.character(group)),
+                                      "Post-EVI", "Post-ASC"),
+                              levels = c("Post-EVI", "Post-ASC")),
+        sample_label = sample_labels[sample]
+      )
+
+    # If genus not recorded at all for this enrichment, build zero-abundance rows
+    # so the plot still renders (all grey tiles)
+    if (nrow(spp_df) == 0) {
+      enrich_meta <- df %>%
+        filter(enrichment_type == enrich) %>%
+        distinct(sample, group)
+      if (nrow(enrich_meta) == 0) {
+        message("No samples for: ", enrich, " — skipping.")
+        next
+      }
+      spp_df <- expand.grid(name   = global_spp,
+                            sample = enrich_meta$sample,
+                            stringsAsFactors = FALSE) %>%
+        left_join(enrich_meta, by = "sample") %>%
+        mutate(
+          rel_abund    = 0,
+          sample_type  = factor(if_else(grepl("^EVI", as.character(group)),
+                                        "Post-EVI", "Post-ASC"),
+                                levels = c("Post-EVI", "Post-ASC")),
+          sample_label = sample_labels[sample]
+        )
+    }
+
+    file_slug <- gsub("[^A-Za-z0-9]", "_", enrich)
+
+    plot_read_genus_heatmap(
+      spp_df,
+      title     = paste0("<i>", pg$genus, "</i> Species Relative Abundance - ",
+                         enrichment_labels[enrich], " (Reads)"),
+      subtitle  = "Colour intensity = relative abundance (% of classified bases); grey = not detected",
+      save_path = file.path(out_dir,
+                            paste0(pg$slug, "_", file_slug, "_spp_heatmap_reads.png"))
+    )
+
+    message(pg$genus, " heatmap done: ", enrich)
+  }
+}
+
+```
+
+
+---
+
+# Host DNA Proportion - Bacteria vs Eukaryota vs Unclassified
+
+Proportion of total sequenced bases attributable to host/eukaryotic DNA (e.g. *Gallus gallus*), bacterial reads, other classified (Archaea, Viruses), and unclassified reads. Calculated per sample at genus level.
+
+```{r Host proportion chart, fig.height=6, fig.width=12}
+
+if (!"superkingdom" %in% names(df_raw)) {
+  message("NOTE: 'superkingdom' column missing - host proportion chart requires re-running kraken2_bpm.py. Skipping.")
+  knitr::knit_exit()
+}
+
+host_df <- df_raw %>%
+  filter(tax_level == "genus") %>%
+  group_by(enrichment_type, group, sample) %>%
+  summarise(
+    total_bases     = first(total_bases),
+    bacteria_bases  = sum(bases[superkingdom == "Bacteria"],                          na.rm = TRUE),
+    gallus_bases    = sum(bases[taxon == "Gallus"],                                   na.rm = TRUE),
+    other_euk_bases = sum(bases[superkingdom == "Eukaryota" & taxon != "Gallus"],     na.rm = TRUE),
+    other_bases     = sum(bases[!superkingdom %in% c("Bacteria", "Eukaryota", "Unknown")],
+                          na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    unclassified_bases = total_bases - bacteria_bases - gallus_bases -
+                         other_euk_bases - other_bases,
+    `Bacteria`         = bacteria_bases    / total_bases * 100,
+    `Gallus gallus`    = gallus_bases      / total_bases * 100,
+    `Other Eukaryota`  = other_euk_bases   / total_bases * 100,
+    `Other classified` = other_bases       / total_bases * 100,
+    `Unclassified`     = unclassified_bases / total_bases * 100,
+    sample_label = factor(sample_labels[sample],
+                          levels = unique(sample_labels[unique(sample[order(group, sample)])])),
+    sample_type  = factor(if_else(grepl("^EVI", as.character(group)), "Post-EVI", "Post-ASC"),
+                          levels = c("Post-EVI", "Post-ASC"))
+  ) %>%
+  pivot_longer(
+    cols      = c(`Bacteria`, `Gallus gallus`, `Other Eukaryota`,
+                  `Other classified`, `Unclassified`),
+    names_to  = "category",
+    values_to = "pct"
+  ) %>%
+  mutate(category = factor(category,
+                           levels = c("Gallus gallus", "Other Eukaryota",
+                                      "Bacteria", "Other classified", "Unclassified")))
+
+host_colours <- c(
+  "Gallus gallus"    = "#FF7F00",
+  "Other Eukaryota"  = "#E31A1C",
+  "Bacteria"         = "#1F78B4",
+  "Other classified" = "#6A3D9A",
+  "Unclassified"     = "#B2DF8A"
+)
+
+# Combined 3-row × 2-column plot: rows = enrichment type, columns = Post-EVI / Post-ASC
+host_plot_df <- host_df %>%
+  mutate(
+    sample_label    = factor(sample_labels[sample], levels = paste0("CH0", 1:6)),
+    sample_type     = factor(if_else(grepl("^EVI", as.character(group)),
+                                     "Post-EVI", "Post-ASC"),
+                             levels = c("Post-EVI", "Post-ASC")),
+    enrichment_type = factor(as.character(enrichment_type),
+                             levels = levels(df_raw$enrichment_type))
+  )
+
+p_host_all <- ggplot(host_plot_df, aes(x = sample_label, y = pct, fill = category)) +
+  geom_col(width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    values = host_colours,
+    labels = function(b) ifelse(b == "Gallus gallus", "*Gallus gallus*", b)
+  ) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"),
+                     expand = expansion(mult = c(0, 0.02))) +
+  facet_grid(enrichment_type ~ sample_type, scales = "free_x", space = "free_x") +
+  labs(
+    title    = "Host vs Bacterial vs Unclassified bases - All enrichment types",
+    subtitle = "Proportion of total sequenced bases; *Gallus gallus* shown separately from other Eukaryota",
+    x        = NULL,
+    y        = "% of total bases",
+    fill     = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_markdown(size = 10, colour = "grey40"),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    strip.text.x    = element_text(face = "bold", size = 12),
+    strip.text.y    = element_text(face = "bold", size = 10),
+    panel.spacing   = unit(0.6, "lines"),
+    legend.text     = element_markdown(),
+    legend.position = "right"
+  )
+
+print(p_host_all)
+ggsave(file.path(out_dir, "host_proportion_all_enrichments.png"),
+       p_host_all, width = 12, height = 10, dpi = 600)
+message("Saved: host_proportion_all_enrichments.png")
+
+```
+
+
+---
+
+# Non-bacterial Microbiome - Archaea and Viruses
+
+Bubble plot of Archaea and Virus genera detected per sample. Bubble area is proportional to relative abundance (% of all classified bases). Faceted by Post-EVI vs Post-ASC, one plot per enrichment type.
+
+```{r nonbact_bubble, fig.height=6, fig.width=16}
+
+if (!"superkingdom" %in% names(df_raw)) {
+  message("NOTE: 'superkingdom' column missing - non-bacterial bubble plots require re-running kraken2_bpm.py. Skipping.")
+} else {
+
+  nonbact_df <- df_raw %>%
+    filter(tax_level == "genus",
+           superkingdom %in% c("Archaea", "Viruses"),
+           rel_abund > 0) %>%
+    mutate(
+      taxon_label  = paste0("*", taxon, "* (", superkingdom, ")"),
+      sample_type  = factor(if_else(grepl("^EVI", as.character(group)),
+                                    "Post-EVI", "Post-ASC"),
+                            levels = c("Post-EVI", "Post-ASC")),
+      sample_label = factor(sample_labels[sample],
+                            levels = paste0("CH0", 1:6))
+    )
+
+  for (enrich in levels(df_raw$enrichment_type)) {
+    sub <- nonbact_df %>% filter(enrichment_type == enrich)
+    if (nrow(sub) == 0) { message("No non-bacterial data for: ", enrich, " — skipping."); next }
+
+    enrich_lbl <- enrichment_labels[enrich]
+    file_slug  <- gsub("[^A-Za-z0-9]", "_", enrich)
+
+    taxon_order <- sub %>%
+      group_by(taxon_label, superkingdom) %>%
+      summarise(m = mean(rel_abund), .groups = "drop") %>%
+      arrange(superkingdom, m) %>%
+      pull(taxon_label)
+
+    sub <- sub %>% mutate(taxon_label = factor(taxon_label, levels = taxon_order))
+
+    p <- ggplot(sub, aes(x = taxon_label, y = sample_label,
+                         size = rel_abund, colour = superkingdom)) +
+      geom_point(alpha = 0.85) +
+      scale_size(range  = c(2, 10),
+                 trans  = "sqrt",
+                 breaks = c(0.001, 0.01, 0.1, 1),
+                 labels = c("0.001", "0.010", "0.100", "1.000"),
+                 name   = "Rel. abund (%)") +
+      scale_colour_manual(values = c("Archaea" = "#33A02C", "Viruses" = "#6A3D9A"),
+                          name   = "Kingdom") +
+      facet_grid(. ~ sample_type, scales = "free_x", space = "free_x") +
+      labs(
+        title    = paste0("Non-bacterial microbiome reads: Archaea and Viruses\n", enrich_lbl),
+        subtitle = "Bubble area proportional to relative abundance (% of all classified bases)",
+        x = NULL, y = NULL
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        axis.text.x      = element_markdown(angle = 45, hjust = 1, size = 9),
+        axis.text.y      = element_text(size = 11),
+        plot.title       = element_text(face = "bold", size = 13),
+        plot.subtitle    = element_text(size = 10, colour = "grey40"),
+        strip.text       = element_text(face = "bold", size = 12),
+        panel.grid.major = element_line(colour = "grey90"),
+        panel.grid.minor = element_blank()
+      )
+
+    print(p)
+    ggsave(file.path(out_dir, paste0("nonbact_bubble_", file_slug, ".png")),
+           p, width = 16, height = 6, dpi = 600)
+    message("Saved non-bacterial bubble: ", enrich)
+  }
+}
+
+```
+
+
+---
+
+# Diversity Analysis - Alpha, Beta & PERMANOVA
+
+```{r Diversity helper functions}
+
+# ── Alpha diversity ────────────────────────────────────────────────────────────
+# Builds Shannon, Simpson, and observed richness from base counts per sample,
+# then plots boxplots + jitter with Wilcoxon p-values per metric.
+# data_sub : a data.frame with columns sample, taxon, bases, group (factor)
+# label_a/b: group labels to compare (Post-EVI vs Post-ASC)
+
+plot_alpha_bpm <- function(data_sub, label_a, label_b, title_str,
+                            col_a = "#377EB8", col_b = "#E41A1C",
+                            save_path = NULL) {
+
+  make_tbl <- function(df, label) {
+    wide <- df %>%
+      filter(as.character(group) == label) %>%
+      select(sample, taxon, bases) %>%
+      pivot_wider(names_from = taxon, values_from = bases, values_fill = 0L)
+    mat <- wide %>% column_to_rownames("sample") %>% as.matrix()
+    tibble(
+      sample   = rownames(mat),
+      group    = label,
+      Shannon  = diversity(mat, index = "shannon"),
+      Simpson  = diversity(mat, index = "simpson"),
+      Richness = rowSums(mat > 0)
+    )
+  }
+
+  alpha_df <- bind_rows(
+    make_tbl(data_sub, label_a),
+    make_tbl(data_sub, label_b)
+  ) %>%
+    mutate(group = factor(group, levels = c(label_a, label_b)))
+
+  cols <- setNames(c(col_a, col_b), c(label_a, label_b))
+
+  alpha_long <- alpha_df %>%
+    pivot_longer(c(Shannon, Simpson, Richness),
+                 names_to = "Metric", values_to = "Value") %>%
+    mutate(Metric = factor(Metric, levels = c("Shannon", "Simpson", "Richness")))
+
+  pvals <- alpha_long %>%
+    group_by(Metric) %>%
+    summarise(
+      p = tryCatch(
+        wilcox.test(Value[group == label_a], Value[group == label_b],
+                    exact = FALSE)$p.value,
+        error = function(e) NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(label = case_when(
+      p < 0.001   ~ "***",
+      p < 0.01    ~ "**",
+      p < 0.05    ~ "*",
+      !is.na(p)   ~ paste0("p = ", round(p, 3)),
+      TRUE        ~ ""
+    ))
+
+  p <- ggplot(alpha_long, aes(x = group, y = Value, fill = group, colour = group)) +
+    geom_boxplot(width = 0.45, alpha = 0.6, outlier.shape = NA, colour = "grey30") +
+    geom_jitter(width = 0.1, size = 2.2, alpha = 0.85) +
+    geom_text(data = pvals, aes(x = 1.5, y = Inf, label = label),
+              inherit.aes = FALSE, vjust = 1.6, size = 3.8, colour = "black") +
+    facet_wrap(~ Metric, scales = "free_y", ncol = 3) +
+    scale_fill_manual(values = cols) +
+    scale_colour_manual(values = cols) +
+    labs(title    = title_str,
+         subtitle = "Wilcoxon rank-sum: *** p < 0.001, ** < 0.01, * < 0.05\nAlpha diversity calculated from base counts assigned per taxon",
+         x = NULL, y = NULL) +
+    theme_bw(base_size = 13) +
+    theme(legend.position  = "none",
+          axis.text        = element_text(size = 11),
+          strip.text       = element_text(face = "bold", size = 13),
+          plot.title       = element_text(face = "bold", size = 14),
+          plot.subtitle    = element_text(size = 10, colour = "grey40"),
+          strip.background = element_rect(fill = "lightgrey"))
+
+  print(p)
+  if (!is.null(save_path)) ggsave(save_path, p, width = 10, height = 5, dpi = 600)
+  invisible(p)
+}
+
+
+# ── Beta diversity - Bray-Curtis PCoA + PERMANOVA ─────────────────────────────
+# Uses relative abundance for Bray-Curtis dissimilarities.
+# Plots PCoA with 95% ellipses; PERMANOVA R² and p-value shown in subtitle.
+
+plot_beta_pcoa_bpm <- function(data_sub, label_a, label_b, title_str,
+                                col_a = "#377EB8", col_b = "#E41A1C",
+                                save_path = NULL) {
+
+  wide <- data_sub %>%
+    select(sample, taxon, rel_abund) %>%
+    pivot_wider(names_from = taxon, values_from = rel_abund, values_fill = 0)
+  mat <- wide %>% column_to_rownames("sample") %>% as.matrix()
+
+  # Group vector aligned with matrix row order
+  sample_grp <- data_sub %>%
+    distinct(sample, group) %>%
+    mutate(group = as.character(group))
+  group_vec <- sample_grp$group[match(rownames(mat), sample_grp$sample)]
+
+  dist_mat <- vegdist(mat, method = "bray")
+  pcoa     <- cmdscale(dist_mat, k = 2, eig = TRUE)
+  var_expl <- abs(pcoa$eig) / sum(abs(pcoa$eig)) * 100
+
+  coords <- as.data.frame(pcoa$points) %>%
+    setNames(c("PC1", "PC2")) %>%
+    rownames_to_column("sample") %>%
+    mutate(group = factor(group_vec, levels = c(label_a, label_b)))
+
+  perm <- adonis2(dist_mat ~ group_vec, permutations = 999)
+  r2   <- round(perm$R2[1], 3)
+  p_v  <- perm$`Pr(>F)`[1]
+
+  p <- ggplot(coords, aes(x = PC1, y = PC2, colour = group)) +
+    geom_point(size = 3.5, alpha = 0.85) +
+    stat_ellipse(level = 0.95, linewidth = 0.8) +
+    scale_colour_manual(values = setNames(c(col_a, col_b), c(label_a, label_b))) +
+    guides(colour = guide_legend(title = NULL, override.aes = list(size = 4))) +
+    labs(title    = title_str,
+         subtitle = paste0("Bray-Curtis PCoA | PERMANOVA: R² = ", r2,
+                           ", p = ", round(p_v, 3), " (999 permutations)"),
+         x = paste0("PC1 (", round(var_expl[1], 1), "% variance)"),
+         y = paste0("PC2 (", round(var_expl[2], 1), "% variance)")) +
+    theme_bw(base_size = 13) +
+    theme(plot.title      = element_text(face = "bold", size = 14),
+          plot.subtitle   = element_text(size = 11, colour = "grey40"),
+          axis.text       = element_text(size = 12),
+          axis.title      = element_text(size = 13),
+          legend.text     = element_text(size = 12),
+          legend.position = "bottom")
+
+  print(p)
+  if (!is.null(save_path)) ggsave(save_path, p, width = 8, height = 6, dpi = 600)
+  invisible(p)
+}
+
+
+# ── Per-taxon Wilcoxon tests (Post-EVI vs Post-ASC) ───────────────────────────
+# Returns a table with mean rel_abund per group, raw p-value, BH-adjusted p-value,
+# and significance stars. Only taxa with mean >= min_mean in >= min_samples tested.
+
+run_taxon_tests_bpm <- function(data_sub, label_a, label_b,
+                                 min_mean = 0.1, min_samples = 2) {
+  combined <- bind_rows(
+    data_sub %>% filter(group == label_a) %>%
+      select(sample, taxon, rel_abund, bpm) %>% mutate(grp = label_a),
+    data_sub %>% filter(group == label_b) %>%
+      select(sample, taxon, rel_abund, bpm) %>% mutate(grp = label_b)
+  ) %>%
+    complete(nesting(sample, grp), taxon, fill = list(rel_abund = 0, bpm = 0))
+
+  taxa_keep <- combined %>%
+    group_by(taxon) %>%
+    summarise(mean_abund  = mean(rel_abund),
+              n_nonzero   = sum(rel_abund > 0),
+              .groups     = "drop") %>%
+    filter(mean_abund >= min_mean, n_nonzero >= min_samples) %>%
+    pull(taxon)
+
+  results <- combined %>%
+    filter(taxon %in% taxa_keep) %>%
+    group_by(taxon) %>%
+    summarise(
+      mean_pct_a = mean(rel_abund[grp == label_a]),
+      mean_pct_b = mean(rel_abund[grp == label_b]),
+      p_value    = tryCatch(
+        wilcox.test(rel_abund[grp == label_a],
+                    rel_abund[grp == label_b],
+                    exact = FALSE)$p.value,
+        error = function(e) NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      p_adj     = p.adjust(p_value, method = "BH"),
+      sig_unadj = case_when(p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+                             p_value < 0.05  ~ "*",   TRUE           ~ "ns"),
+      sig       = case_when(p_adj   < 0.001 ~ "***", p_adj   < 0.01 ~ "**",
+                             p_adj   < 0.05  ~ "*",   TRUE           ~ "ns")
+    ) %>%
+    arrange(p_value)
+
+  names(results)[names(results) == "mean_pct_a"] <- paste0("Mean ", label_a, " (%)")
+  names(results)[names(results) == "mean_pct_b"] <- paste0("Mean ", label_b, " (%)")
+  results
+}
+
+
+# Format results table for display / PDF output
+format_stats_display_bpm <- function(results, adjusted = TRUE) {
+  pct_cols <- grep("\\(%\\)$", names(results), value = TRUE)
+  df <- results
+  df[pct_cols]  <- lapply(df[pct_cols], round, 2)
+  df$p_value    <- formatC(df$p_value, format = "e", digits = 2)
+
+  if (adjusted) {
+    df$p_adj <- formatC(df$p_adj, format = "e", digits = 2)
+    df <- df %>% select(taxon, all_of(pct_cols), p_value, p_adj, sig)
+    names(df)[names(df) == "sig"]   <- "Sig. (BH)"
+    names(df)[names(df) == "p_adj"] <- "p-adj (BH)"
+  } else {
+    df <- df %>% select(taxon, all_of(pct_cols), p_value, sig_unadj)
+    names(df)[names(df) == "sig_unadj"] <- "Sig."
+  }
+  names(df)[names(df) == "taxon"]   <- "Taxon"
+  names(df)[names(df) == "p_value"] <- "p-value"
+  df
+}
+
+
+# Draw one table page to the active PDF device
+draw_stats_table_bpm <- function(df, title_str) {
+  sig_col  <- if ("Sig. (BH)" %in% names(df)) "Sig. (BH)" else "Sig."
+  sig_vals <- df[[sig_col]]
+  n_rows   <- nrow(df)
+  n_cols   <- ncol(df)
+
+  row_fill <- case_when(sig_vals == "***" ~ "#fd7e14",
+                        sig_vals == "**"  ~ "#ffc107",
+                        sig_vals == "*"   ~ "#fff3cd",
+                        TRUE              ~ "#ffffff")
+  fill_mat <- matrix(rep(row_fill, n_cols), nrow = n_rows, ncol = n_cols)
+
+  # Italicise the Taxon column (scientific names), keep other columns plain
+  face_mat <- matrix("plain", nrow = n_rows, ncol = n_cols)
+  taxon_col <- which(names(df) == "Taxon")
+  if (length(taxon_col) == 1) face_mat[, taxon_col] <- "italic"
+
+  tbl <- tableGrob(
+    df, rows = NULL,
+    theme = ttheme_default(
+      core    = list(bg_params = list(fill = fill_mat, col = "#dee2e6"),
+                     fg_params = list(fontsize = 7, fontface = face_mat)),
+      colhead = list(bg_params = list(fill = "#495057", col = "#dee2e6"),
+                     fg_params = list(fontsize = 7.5, col = "white",
+                                      fontface = "bold"))
+    )
+  )
+
+  title_grob <- grid::textGrob(title_str,
+                                gp    = grid::gpar(fontsize = 10, fontface = "bold"),
+                                hjust = 0.5, x = 0.5)
+  combined <- arrangeGrob(title_grob, tbl, nrow = 2, heights = c(0.06, 0.94))
+  grid::grid.draw(combined)
+}
+
+
+# Save a 2-page PDF: page 1 = unadjusted p-values, page 2 = BH-adjusted
+save_stats_pdf_bpm <- function(results, title_str, path) {
+  unadj_df <- format_stats_display_bpm(results, adjusted = FALSE)
+  adj_df   <- format_stats_display_bpm(results, adjusted = TRUE)
+  page_h   <- max(5, nrow(results) * 0.26 + 1.8)
+  pdf(path, width = 16, height = page_h)
+  draw_stats_table_bpm(unadj_df, paste0(title_str, "  |  Unadjusted p-values"))
+  grid::grid.newpage()
+  draw_stats_table_bpm(adj_df,   paste0(title_str, "  |  BH-adjusted p-values (FDR)"))
+  dev.off()
+  message("Saved: ", basename(path))
+  invisible(path)
+}
+
+```
+
+
+## Alpha Diversity - Post-EVI vs Post-ASC
+
+Shannon entropy, Simpson index, and observed richness calculated from base counts assigned to each taxon per sample. Wilcoxon rank-sum p-value shown above each panel.
+
+```{r Alpha diversity, fig.height=5, fig.width=10}
+
+tax_level_labels <- c(genus = "Genus", family = "Family", species = "Species")
+
+for (enrich in levels(df$enrichment_type)) {
+  for (tax_lvl in c("genus", "family", "species")) {
+
+    div_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(group = as.character(group),
+             sample_type = if_else(grepl("^EVI", group), "Post-EVI", "Post-ASC"))
+
+    # Need at least 2 samples per group
+    n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+    n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+    if (n_evi < 2 || n_asc < 2) next
+
+    enrich_lbl <- enrichment_labels[enrich]
+    lvl_lbl    <- tax_level_labels[tax_lvl]
+    file_slug  <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+
+    plot_alpha_bpm(
+      data_sub   = div_df %>% select(-group) %>% rename(group = sample_type),
+      label_a    = "Post-EVI",
+      label_b    = "Post-ASC",
+      title_str  = paste0("Alpha Diversity (", lvl_lbl, " level) - ", enrich_lbl),
+      save_path  = file.path(out_dir, paste0(file_slug, "_alpha_diversity.png"))
+    )
+  }
+}
+
+```
+
+
+## Beta Diversity - Bray-Curtis PCoA + PERMANOVA
+
+Principal coordinates analysis of Bray-Curtis dissimilarities (relative abundance). Ellipses show 95% confidence intervals. PERMANOVA tests whether group membership explains community composition.
+
+```{r Beta diversity PERMANOVA, fig.height=6, fig.width=8}
+
+for (enrich in levels(df$enrichment_type)) {
+  for (tax_lvl in c("genus", "family", "species")) {
+
+    div_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                   "Post-EVI", "Post-ASC"))
+
+    # Need at least 2 samples per group for PCoA
+    n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+    n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+    if (n_evi < 2 || n_asc < 2) next
+
+    enrich_lbl <- enrichment_labels[enrich]
+    lvl_lbl    <- tax_level_labels[tax_lvl]
+    file_slug  <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+
+    plot_beta_pcoa_bpm(
+      data_sub  = div_df %>% select(-group) %>% rename(group = sample_type),
+      label_a   = "Post-EVI",
+      label_b   = "Post-ASC",
+      title_str = paste0("Beta Diversity - Bray-Curtis PCoA (", lvl_lbl, " level)\n", enrich_lbl),
+      save_path = file.path(out_dir, paste0(file_slug, "_beta_pcoa.png"))
+    )
+  }
+}
+
+```
+
+
+## Beta Diversity - Bray-Curtis PCoA + Flock-Stratified PERMANOVA
+
+Flock identity (CH01–CH06) is used as a blocking factor via `permute::how(blocks = flock)`. This restricts permutations within flocks to account for the shared flock origin of Post-EVI and Post-ASC samples, giving a more conservative and appropriate test than the unstratified version above.
+
+```{r Beta diversity stratified PERMANOVA, fig.height=6, fig.width=8}
+
+for (enrich in levels(df$enrichment_type)) {
+  for (tax_lvl in c("genus", "family", "species")) {
+
+    div_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                   "Post-EVI", "Post-ASC"))
+
+    n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+    n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+    if (n_evi < 2 || n_asc < 2) next
+
+    enrich_lbl <- enrichment_labels[enrich]
+    lvl_lbl    <- tax_level_labels[tax_lvl]
+    file_slug  <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+
+    wide <- div_df %>%
+      select(sample, taxon, rel_abund) %>%
+      pivot_wider(names_from = taxon, values_from = rel_abund, values_fill = 0)
+    mat <- wide %>% column_to_rownames("sample") %>% as.matrix()
+
+    sample_grp <- div_df %>% distinct(sample, sample_type)
+    group_vec  <- sample_grp$sample_type[match(rownames(mat), sample_grp$sample)]
+
+    # Extract flock ID (CH01, CH02 ...) from sample names for blocking
+    flock_vec  <- sub("_(EVI|ASC).*", "", rownames(mat))
+
+    dist_mat <- vegdist(mat, method = "bray")
+
+    # Flock-stratified PERMANOVA
+    perm_ctrl <- how(blocks = flock_vec, nperm = 999)
+    perm_strat <- adonis2(dist_mat ~ group_vec, permutations = perm_ctrl)
+    r2  <- round(perm_strat$R2[1], 3)
+    p_v <- perm_strat$`Pr(>F)`[1]
+
+    # PCoA coordinates (same as unstratified - visualisation unchanged)
+    pcoa     <- cmdscale(dist_mat, k = 2, eig = TRUE)
+    var_expl <- abs(pcoa$eig) / sum(abs(pcoa$eig)) * 100
+
+    coords <- as.data.frame(pcoa$points) %>%
+      setNames(c("PC1", "PC2")) %>%
+      rownames_to_column("sample") %>%
+      mutate(group = factor(group_vec, levels = c("Post-EVI", "Post-ASC")),
+             flock = flock_vec)
+
+    p_strat <- ggplot(coords, aes(x = PC1, y = PC2, colour = group)) +
+      geom_point(size = 3.5, alpha = 0.85) +
+      geom_text(aes(label = flock), nudge_y = 0.015, size = 3, colour = "grey30") +
+      stat_ellipse(level = 0.95, linewidth = 0.8) +
+      scale_colour_manual(values = c("Post-EVI" = "#377EB8", "Post-ASC" = "#E41A1C")) +
+      guides(colour = guide_legend(title = NULL, override.aes = list(size = 4))) +
+      labs(
+        title    = paste0("Beta Diversity - Bray-Curtis PCoA (", lvl_lbl, " level)\n", enrich_lbl),
+        subtitle = paste0("Flock-stratified PERMANOVA: R² = ", r2,
+                          ", p = ", round(p_v, 3), " (999 permutations, blocked by flock)"),
+        x = paste0("PC1 (", round(var_expl[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_expl[2], 1), "% variance)")
+      ) +
+      theme_bw(base_size = 13) +
+      theme(
+        plot.title      = element_text(face = "bold", size = 14),
+        plot.subtitle   = element_text(size = 11, colour = "grey40"),
+        axis.text       = element_text(size = 12),
+        axis.title      = element_text(size = 13),
+        legend.text     = element_text(size = 12),
+        legend.position = "bottom"
+      )
+
+    print(p_strat)
+
+    fname_strat <- file.path(out_dir, paste0(file_slug, "_beta_pcoa_stratified.png"))
+    ggsave(fname_strat, p_strat, width = 8, height = 6, dpi = 600)
+    message("Saved: ", basename(fname_strat))
+  }
+}
+
+```
+
+
+## Stratified PERMANOVA Summary Table
+
+```{r Stratified PERMANOVA summary table}
+
+perm_results_strat <- list()
+
+for (enrich in levels(df$enrichment_type)) {
+  for (tax_lvl in c("genus", "family", "species")) {
+
+    div_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                   "Post-EVI", "Post-ASC"))
+
+    n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+    n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+    if (n_evi < 2 || n_asc < 2) next
+
+    wide <- div_df %>%
+      select(sample, taxon, rel_abund) %>%
+      pivot_wider(names_from = taxon, values_from = rel_abund, values_fill = 0)
+    mat <- wide %>% column_to_rownames("sample") %>% as.matrix()
+
+    sample_grp <- div_df %>% distinct(sample, sample_type)
+    group_vec  <- sample_grp$sample_type[match(rownames(mat), sample_grp$sample)]
+    flock_vec  <- sub("_(EVI|ASC).*", "", rownames(mat))
+
+    dist_mat   <- vegdist(mat, method = "bray")
+    perm_ctrl  <- how(blocks = flock_vec, nperm = 999)
+    perm_strat <- adonis2(dist_mat ~ group_vec, permutations = perm_ctrl)
+
+    perm_results_strat[[paste(enrich, tax_lvl, sep = " | ")]] <- tibble(
+      Enrichment   = enrichment_labels[enrich],
+      `Tax. level` = tax_level_labels[tax_lvl],
+      `n Post-EVI` = n_evi,
+      `n Post-ASC` = n_asc,
+      `R²`         = round(perm_strat$R2[1], 3),
+      `p-value`    = round(perm_strat$`Pr(>F)`[1], 3),
+      Significant  = ifelse(perm_strat$`Pr(>F)`[1] < 0.05, "Yes", "No")
+    )
+  }
+}
+
+perm_table_strat <- bind_rows(perm_results_strat)
+print(perm_table_strat)
+
+write.table(perm_table_strat,
+            file.path(out_dir, "permanova_stratified_summary.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+message("Stratified PERMANOVA summary saved to: permanova_stratified_summary.tsv")
+
+```
+
+
+## PERMANOVA Summary Table
+
+```{r PERMANOVA summary table}
+
+perm_results <- list()
+
+for (enrich in levels(df$enrichment_type)) {
+  for (tax_lvl in c("genus", "family", "species")) {
+
+    div_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                   "Post-EVI", "Post-ASC"))
+
+    n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+    n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+    if (n_evi < 2 || n_asc < 2) next
+
+    wide <- div_df %>%
+      select(sample, taxon, rel_abund) %>%
+      pivot_wider(names_from = taxon, values_from = rel_abund, values_fill = 0)
+    mat <- wide %>% column_to_rownames("sample") %>% as.matrix()
+
+    sample_grp <- div_df %>% distinct(sample, sample_type)
+    group_vec  <- sample_grp$sample_type[match(rownames(mat), sample_grp$sample)]
+
+    dist_mat <- vegdist(mat, method = "bray")
+    perm     <- adonis2(dist_mat ~ group_vec, permutations = 999)
+
+    perm_results[[paste(enrich, tax_lvl, sep = " | ")]] <- tibble(
+      Enrichment     = enrichment_labels[enrich],
+      `Tax. level`   = tax_level_labels[tax_lvl],
+      `n Post-EVI`   = n_evi,
+      `n Post-ASC`   = n_asc,
+      `R²`           = round(perm$R2[1], 3),
+      `p-value`      = round(perm$`Pr(>F)`[1], 3),
+      Significant    = ifelse(perm$`Pr(>F)`[1] < 0.05, "Yes", "No")
+    )
+  }
+}
+
+perm_table <- bind_rows(perm_results)
+print(perm_table)
+
+# Save as TSV
+write.table(perm_table,
+            file.path(out_dir, "permanova_summary.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+message("PERMANOVA summary saved to: permanova_summary.tsv")
+
+```
+
+
+---
+
+## Per-Taxon Statistical Tests - Post-EVI vs Post-ASC
+
+Wilcoxon rank-sum test (two-sided) per taxon at genus, family, and species level, run separately within each enrichment type. Only taxa present with mean relative abundance ≥ 0.1% in ≥ 2 samples are tested. Page 1 of each PDF shows unadjusted p-values; page 2 shows Benjamini-Hochberg FDR-corrected p-values. Rows highlighted orange (***), yellow (**), or pale yellow (*).
+
+```{r Statistical tests per taxon}
+
+tax_level_labels <- c(genus = "Genus", family = "Family", species = "Species")
+
+for (tax_lvl in c("genus", "family", "species")) {
+  for (enrich in levels(df$enrichment_type)) {
+
+    test_df <- df %>%
+      filter(enrichment_type == enrich, tax_level == tax_lvl) %>%
+      mutate(group = if_else(grepl("^EVI", as.character(group)),
+                             "Post-EVI", "Post-ASC"))
+
+    n_evi <- n_distinct(test_df$sample[test_df$group == "Post-EVI"])
+    n_asc <- n_distinct(test_df$sample[test_df$group == "Post-ASC"])
+    if (n_evi < 2 || n_asc < 2) next
+
+    results <- run_taxon_tests_bpm(test_df, "Post-EVI", "Post-ASC")
+
+    if (nrow(results) == 0) {
+      message("No taxa passed filters for: ", enrich, " | ", tax_lvl)
+      next
+    }
+
+    enrich_lbl <- enrichment_labels[enrich]
+    lvl_lbl    <- tax_level_labels[tax_lvl]
+    file_slug  <- paste0(gsub("[^A-Za-z0-9]", "_", enrich), "_", tax_lvl)
+    title_str  <- paste0("Post-EVI vs Post-ASC - ", lvl_lbl, " level | ", enrich_lbl)
+
+    pdf_path <- file.path(out_dir, paste0("stats_", file_slug, "_EVI_vs_ASC.pdf"))
+    save_stats_pdf_bpm(results, title_str, pdf_path)
+  }
+}
+
+message("\nAll statistical PDFs saved to: ", out_dir)
+
+```
+
+
+---
+
+# Sensitivity analysis - exclude CH04 Post-ASC (BF Bolton Base + CAT)
+
+The original Post-ASC group for the BF Bolton Base + CAT enrichment shows large dispersion in both the PCoA and the alpha-diversity boxplots, with CH04 appearing as a likely outlier. This section drops `CH04_ASC_BFBB` and re-runs alpha diversity, Bray-Curtis PCoA + PERMANOVA, and the per-taxon Wilcoxon tests for that enrichment only, so we can check whether the EVI vs ASC differences are driven by that one sample. Original outputs are kept; new files are written with a `_no_CH04_ASC` suffix.
+
+```{r Sensitivity - drop CH04 ASC BFBB, fig.height=5, fig.width=10}
+
+drop_samples <- c("CH04_ASC_BFBB")
+sens_enrich  <- "BF Bolton Base + CAT"
+sens_slug    <- gsub("[^A-Za-z0-9]", "_", sens_enrich)
+
+df_sens <- df %>%
+  filter(enrichment_type == sens_enrich, !sample %in% drop_samples)
+
+message("Sensitivity analysis - dropped samples: ",
+        paste(drop_samples, collapse = ", "))
+message("Remaining sample counts after exclusion:")
+print(df_sens %>%
+        filter(tax_level == "genus") %>%
+        mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                     "Post-EVI", "Post-ASC")) %>%
+        distinct(sample, sample_type) %>%
+        count(sample_type))
+
+```
+
+
+## Alpha diversity (CH04 Post-ASC excluded)
+
+```{r Sensitivity alpha diversity, fig.height=5, fig.width=10}
+
+for (tax_lvl in c("genus", "family", "species")) {
+
+  div_df <- df_sens %>%
+    filter(tax_level == tax_lvl) %>%
+    mutate(group = as.character(group),
+           sample_type = if_else(grepl("^EVI", group), "Post-EVI", "Post-ASC"))
+
+  n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+  n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+  if (n_evi < 2 || n_asc < 2) next
+
+  lvl_lbl   <- tax_level_labels[tax_lvl]
+  file_slug <- paste0(sens_slug, "_", tax_lvl, "_no_CH04_ASC")
+
+  plot_alpha_bpm(
+    data_sub  = div_df %>% select(-group) %>% rename(group = sample_type),
+    label_a   = "Post-EVI",
+    label_b   = "Post-ASC",
+    title_str = paste0("Alpha Diversity (", lvl_lbl, " level) - ", sens_enrich,
+                       "\n(CH04 Post-ASC excluded)"),
+    save_path = file.path(out_dir, paste0(file_slug, "_alpha_diversity.png"))
+  )
+}
+
+```
+
+
+## Beta diversity - Bray-Curtis PCoA (CH04 Post-ASC excluded)
+
+```{r Sensitivity beta diversity, fig.height=6, fig.width=8}
+
+for (tax_lvl in c("genus", "family", "species")) {
+
+  div_df <- df_sens %>%
+    filter(tax_level == tax_lvl) %>%
+    mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                 "Post-EVI", "Post-ASC"))
+
+  n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+  n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+  if (n_evi < 2 || n_asc < 2) next
+
+  lvl_lbl   <- tax_level_labels[tax_lvl]
+  file_slug <- paste0(sens_slug, "_", tax_lvl, "_no_CH04_ASC")
+
+  plot_beta_pcoa_bpm(
+    data_sub  = div_df %>% select(-group) %>% rename(group = sample_type),
+    label_a   = "Post-EVI",
+    label_b   = "Post-ASC",
+    title_str = paste0("Beta Diversity - Bray-Curtis PCoA (", lvl_lbl, " level)\n",
+                       sens_enrich, " (CH04 Post-ASC excluded)"),
+    save_path = file.path(out_dir, paste0(file_slug, "_beta_pcoa.png"))
+  )
+}
+
+```
+
+
+## PERMANOVA summary table (CH04 Post-ASC excluded)
+
+```{r Sensitivity PERMANOVA summary}
+
+perm_results_sens <- list()
+
+for (tax_lvl in c("genus", "family", "species")) {
+
+  div_df <- df_sens %>%
+    filter(tax_level == tax_lvl) %>%
+    mutate(sample_type = if_else(grepl("^EVI", as.character(group)),
+                                 "Post-EVI", "Post-ASC"))
+
+  n_evi <- n_distinct(div_df$sample[div_df$sample_type == "Post-EVI"])
+  n_asc <- n_distinct(div_df$sample[div_df$sample_type == "Post-ASC"])
+  if (n_evi < 2 || n_asc < 2) next
+
+  wide <- div_df %>%
+    select(sample, taxon, rel_abund) %>%
+    pivot_wider(names_from = taxon, values_from = rel_abund, values_fill = 0)
+  mat <- wide %>% column_to_rownames("sample") %>% as.matrix()
+
+  sample_grp <- div_df %>% distinct(sample, sample_type)
+  group_vec  <- sample_grp$sample_type[match(rownames(mat), sample_grp$sample)]
+
+  dist_mat <- vegdist(mat, method = "bray")
+  perm     <- adonis2(dist_mat ~ group_vec, permutations = 999)
+
+  # PERMDISP - test homogeneity of group dispersions (helps interpret PERMANOVA)
+  bd       <- betadisper(dist_mat, group_vec)
+  bd_p     <- tryCatch(permutest(bd, permutations = 999)$tab[["Pr(>F)"]][1],
+                       error = function(e) NA_real_)
+
+  perm_results_sens[[paste(sens_enrich, tax_lvl, sep = " | ")]] <- tibble(
+    Enrichment        = sens_enrich,
+    `Tax. level`      = tax_level_labels[tax_lvl],
+    `n Post-EVI`      = n_evi,
+    `n Post-ASC`      = n_asc,
+    `R²`              = round(perm$R2[1], 3),
+    `p-value`         = round(perm$`Pr(>F)`[1], 3),
+    Significant       = ifelse(perm$`Pr(>F)`[1] < 0.05, "Yes", "No"),
+    `PERMDISP p`      = round(bd_p, 3),
+    `Excluded sample` = paste(drop_samples, collapse = ", ")
+  )
+}
+
+perm_table_sens <- bind_rows(perm_results_sens)
+print(perm_table_sens)
+
+write.table(perm_table_sens,
+            file.path(out_dir, "permanova_summary_no_CH04_ASC.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+message("Sensitivity PERMANOVA summary saved to: permanova_summary_no_CH04_ASC.tsv")
+
+
+# Side-by-side comparison with the full-data PERMANOVA results, if available
+if (exists("perm_table")) {
+  comparison <- perm_table %>%
+    filter(Enrichment == sens_enrich) %>%
+    select(`Tax. level`, `R² (full)` = `R²`, `p (full)` = `p-value`) %>%
+    left_join(
+      perm_table_sens %>%
+        select(`Tax. level`,
+               `R² (no CH04)` = `R²`,
+               `p (no CH04)`  = `p-value`,
+               `PERMDISP p (no CH04)` = `PERMDISP p`),
+      by = "Tax. level"
+    )
+  message("\nFull vs sensitivity comparison (BF Bolton Base + CAT):")
+  print(comparison)
+
+  write.table(comparison,
+              file.path(out_dir, "permanova_comparison_full_vs_no_CH04_ASC.tsv"),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+```
+
+
+## Per-taxon statistical tests (CH04 Post-ASC excluded)
+
+```{r Sensitivity per-taxon stats}
+
+for (tax_lvl in c("genus", "family", "species")) {
+
+  test_df <- df_sens %>%
+    filter(tax_level == tax_lvl) %>%
+    mutate(group = if_else(grepl("^EVI", as.character(group)),
+                           "Post-EVI", "Post-ASC"))
+
+  n_evi <- n_distinct(test_df$sample[test_df$group == "Post-EVI"])
+  n_asc <- n_distinct(test_df$sample[test_df$group == "Post-ASC"])
+  if (n_evi < 2 || n_asc < 2) next
+
+  results <- run_taxon_tests_bpm(test_df, "Post-EVI", "Post-ASC")
+
+  if (nrow(results) == 0) {
+    message("No taxa passed filters for: ", sens_enrich, " | ", tax_lvl,
+            " (CH04 Post-ASC excluded)")
+    next
+  }
+
+  lvl_lbl   <- tax_level_labels[tax_lvl]
+  file_slug <- paste0(sens_slug, "_", tax_lvl, "_no_CH04_ASC")
+  title_str <- paste0("Post-EVI vs Post-ASC - ", lvl_lbl, " level | ",
+                      sens_enrich, " (CH04 Post-ASC excluded)")
+
+  pdf_path <- file.path(out_dir, paste0("stats_", file_slug, "_EVI_vs_ASC.pdf"))
+  save_stats_pdf_bpm(results, title_str, pdf_path)
+}
+
+message("\nSensitivity-analysis outputs saved to: ", out_dir)
+
+```
+

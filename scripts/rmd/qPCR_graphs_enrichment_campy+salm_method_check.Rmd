@@ -1,0 +1,1341 @@
+---
+title: "qPCR Enrichment Analysis: Campylobacter and Salmonella"
+author: "Analysis Report"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+# Setup and Data Loading
+
+```{r libraries}
+# Load required libraries
+library(tidyverse)
+library(readxl)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+# Set theme for all plots
+theme_set(theme_minimal(base_size = 12))
+```
+
+```{r helper_functions}
+# Helper function for Wilcoxon test
+safe_wilcox_test <- function(df, value_col, time_col = "Time_hr", baseline_time, test_time = 24) {
+  baseline_data <- df[[value_col]][df[[time_col]] == baseline_time]
+  test_data <- df[[value_col]][df[[time_col]] == test_time]
+  
+  if (length(baseline_data) == 0 || length(test_data) == 0) return(NA_real_)
+  
+  tryCatch(
+    wilcox.test(test_data, baseline_data, exact = FALSE)$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+# Helper function for p-value interpretation
+interpret_p_value <- function(p) {
+  case_when(
+    is.na(p) ~ "Insufficient data",
+    p < 0.001 ~ "Highly significant (p < 0.001)",
+    p < 0.01  ~ "Very significant (p < 0.01)",
+    p < 0.05  ~ "Significant (p < 0.05)",
+    TRUE ~ "Not significant (p >= 0.05)"
+  )
+}
+```
+
+---
+
+# PART 1: CAMPYLOBACTER ANALYSIS
+
+## 1.1 Data Loading and Cleaning
+
+```{r load_campylobacter}
+# Read Campylobacter data
+campy_raw <- read_excel('/Volumes/Alice/1_METHOD_DEVELOPMENT/Enrichment_testing/Raw_data/qPCR_enrichment-samples_Campylobacter.xlsx')
+
+# Clean and prepare data
+campy_cleaned <- campy_raw %>%
+  filter(Type == "Unknown") %>%
+  mutate(
+    Broth = str_extract(Name, "^[A-Z-]+"),
+    Time_hr = as.numeric(str_extract(Name, "\\d+(?=hr)")),
+    Ct = as.numeric(Ct),
+    Concentration = as.numeric(`Calc Conc (ng/ul)`)
+  ) %>%
+  filter(Broth %in% c("BF-BB", "CAT", "BPW", "RVS")) %>%
+  select(Name, Broth, Time_hr, Ct, Concentration, `Calc Conc (ng/ul)`)
+
+# Rename broths to full names
+campy_cleaned <- campy_cleaned %>%
+  mutate(Broth = case_when(
+    Broth == "BF-BB" ~ "BF Bolton Base",
+    Broth == "CAT" ~ "BF Bolton Base + CAT",
+    TRUE ~ Broth
+  ))
+
+# Define baseline times (All broths = 0hr)
+campy_baseline_map <- tibble(
+  Broth = c("BF Bolton Base", "BF Bolton Base + CAT", "BPW", "RVS"),
+  baseline_hr = c(0, 0, 0, 0)
+)
+```
+
+```{r campy_data_summary}
+# Data summary
+campy_summary <- campy_cleaned %>%
+  group_by(Broth, Time_hr) %>%
+  summarise(
+    n_replicates = n(),
+    n_Ct_detected = sum(!is.na(Ct)),
+    n_Conc_detected = sum(!is.na(Concentration)),
+    mean_Ct = mean(Ct, na.rm = TRUE),
+    mean_Conc = mean(Concentration, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(campy_summary, 
+      caption = "Campylobacter Data Summary",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 1.2 Campylobacter Ct Value Analysis
+
+### 1.2.1 Within-Broth Statistics (Ct)
+
+```{r campy_ct_within_broth_stats}
+# Prepare data for baseline vs 24hr comparison
+campy_ct_within_data <- campy_cleaned %>%
+  left_join(campy_baseline_map, by = "Broth") %>%
+  filter(Time_hr %in% c(baseline_hr, 24)) %>%
+  filter(!is.na(Ct))
+
+# Calculate within-broth statistics
+campy_ct_within_stats <- campy_ct_within_data %>%
+  group_by(Broth, baseline_hr) %>%
+  summarise(
+    n_baseline = sum(Time_hr == baseline_hr),
+    n_24hr = sum(Time_hr == 24),
+    mean_Ct_baseline = mean(Ct[Time_hr == baseline_hr]),
+    sd_Ct_baseline = sd(Ct[Time_hr == baseline_hr]),
+    mean_Ct_24hr = mean(Ct[Time_hr == 24]),
+    sd_Ct_24hr = sd(Ct[Time_hr == 24]),
+    delta_Ct = mean_Ct_24hr - mean_Ct_baseline,
+    fold_change = 2^(-delta_Ct),
+    p_value = safe_wilcox_test(cur_data(), "Ct", "Time_hr", unique(baseline_hr), 24),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    comparison = paste0(baseline_hr, "hr vs 24hr"),
+    significant = if_else(!is.na(p_value) & p_value < 0.05, "Yes", "No"),
+    interpretation = interpret_p_value(p_value)
+  )
+
+# Display results
+campy_table1 <- kable(campy_ct_within_stats %>% 
+        select(Broth, comparison, n_baseline, n_24hr, 
+               mean_Ct_baseline, mean_Ct_24hr, delta_Ct, 
+               fold_change, p_value, significant),
+      caption = "Campylobacter Within-Broth Comparison (Ct Values)",
+      digits = c(0, 0, 0, 0, 2, 2, 2, 1, 4, 0)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(campy_ct_within_stats$significant == "Yes"), 
+           bold = TRUE, color = "white", background = "#28a745")
+
+campy_table1
+```
+
+**Detailed Statistical Results (Ct Analysis):**
+
+```{r campy_ct_individual_broth_results, results='asis'}
+# Print detailed results for each broth
+for (i in 1:nrow(campy_ct_within_stats)) {
+  broth_data <- campy_ct_within_stats[i, ]
+  
+  cat("\n#### **", broth_data$Broth, "Broth (", broth_data$comparison, ")**\n\n", sep = "")
+  cat("- **Sample size:** n =", broth_data$n_baseline, "(baseline), n =", broth_data$n_24hr, "(24hr)\n")
+  cat("- **Mean Ct at baseline:**", round(broth_data$mean_Ct_baseline, 2), 
+      "± ", round(broth_data$sd_Ct_baseline, 2), "SD\n")
+  cat("- **Mean Ct at 24hr:**", round(broth_data$mean_Ct_24hr, 2), 
+      "± ", round(broth_data$sd_Ct_24hr, 2), "SD\n")
+  cat("- **ΔCt:**", round(broth_data$delta_Ct, 2), "cycles\n")
+  cat("- **Fold change (2^-ΔCt):**", format(round(broth_data$fold_change, 1), big.mark = ","), 
+      "-fold increase\n")
+  cat("- **Wilcoxon rank-sum test:** p =", format.pval(broth_data$p_value, digits = 4), "\n")
+  cat("- **Significance:**", broth_data$significant, "-", broth_data$interpretation, "\n")
+  
+  # Add interpretation note
+  if (broth_data$delta_Ct < 0) {
+    cat("- **Interpretation:** Ct decreased by", abs(round(broth_data$delta_Ct, 2)), 
+        "cycles, indicating increased target DNA\n")
+  } else if (broth_data$delta_Ct > 0) {
+    cat("- **Interpretation:** Ct increased by", round(broth_data$delta_Ct, 2), 
+        "cycles, indicating decreased target DNA\n")
+  }
+  cat("\n")
+}
+```
+
+**Key Findings (Ct Analysis):**
+
+- **BF Bolton Base**: ΔCt = `r round(campy_ct_within_stats$delta_Ct[campy_ct_within_stats$Broth == "BF Bolton Base"], 2)` cycles → `r format(round(campy_ct_within_stats$fold_change[campy_ct_within_stats$Broth == "BF Bolton Base"], 0), big.mark = ",")`-fold increase (p = `r round(campy_ct_within_stats$p_value[campy_ct_within_stats$Broth == "BF Bolton Base"], 3)`)
+- **BF Bolton Base + CAT**: ΔCt = `r round(campy_ct_within_stats$delta_Ct[campy_ct_within_stats$Broth == "BF Bolton Base + CAT"], 2)` cycles → `r format(round(campy_ct_within_stats$fold_change[campy_ct_within_stats$Broth == "BF Bolton Base + CAT"], 0), big.mark = ",")`-fold increase (p = `r round(campy_ct_within_stats$p_value[campy_ct_within_stats$Broth == "BF Bolton Base + CAT"], 3)`)
+- **BPW**: `r ifelse("BPW" %in% campy_ct_within_stats$Broth, paste0("ΔCt = ", round(campy_ct_within_stats$delta_Ct[campy_ct_within_stats$Broth == "BPW"], 2), " cycles"), "Insufficient data for analysis")`
+- **RVS**: `r ifelse("RVS" %in% campy_ct_within_stats$Broth, paste0("ΔCt = ", round(campy_ct_within_stats$delta_Ct[campy_ct_within_stats$Broth == "RVS"], 2), " cycles"), "No detectable signal")`
+- *Note: Lower Ct = Higher target amount*
+
+**Statistical Note:** Small sample sizes (n=3) limit statistical power to detect significance despite large fold changes.
+
+### 1.2.2 Between-Broth Statistics at 24hr (Ct)
+
+```{r campy_ct_between_broth_stats}
+# Prepare data for between-broth comparison at 24hr
+campy_ct_24hr <- campy_cleaned %>%
+  filter(Time_hr == 24, !is.na(Ct))
+
+# Summary by broth
+campy_ct_24hr_summary <- campy_ct_24hr %>%
+  group_by(Broth) %>%
+  summarise(
+    n = n(),
+    mean_Ct = mean(Ct),
+    sd_Ct = sd(Ct),
+    median_Ct = median(Ct),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_Ct)
+
+kable(campy_ct_24hr_summary,
+      caption = "Campylobacter Ct Values at 24hr (Lower Ct = More target)",
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Kruskal-Wallis test
+if (n_distinct(campy_ct_24hr$Broth) >= 2) {
+  campy_ct_kw <- kruskal.test(Ct ~ Broth, data = campy_ct_24hr)
+  cat("\n**Kruskal-Wallis Test:**\n")
+  cat("χ² =", round(campy_ct_kw$statistic, 3), 
+      ", p =", format.pval(campy_ct_kw$p.value, digits = 3), "\n")
+  
+  if (campy_ct_kw$p.value < 0.05) {
+    cat("**Result: Significant differences exist between broths (p < 0.05)**\n")
+  }
+}
+```
+
+### 1.2.3 Campylobacter Ct Plots
+
+```{r campy_ct_baseline_vs_24hr_plot, fig.height=8}
+# Plot: Baseline vs 24hr (Ct values)
+campy_ct_plot_baseline_24 <- ggplot(campy_ct_within_data, 
+                                     aes(x = factor(Time_hr), y = Ct, 
+                                         fill = factor(Time_hr))) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 2.5) +
+  facet_wrap(~Broth, scales = "free_y", ncol = 2) +
+  scale_y_reverse() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = expression(paste(italic("Campylobacter"), " Ct Values: Baseline vs 24hr Comparison")),
+    subtitle = "Lower Ct = Higher target amount (All broths baseline=0hr)",
+    x = "Time Point (hours)",
+    y = "Ct Value",
+    fill = "Time Point"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 11),
+    strip.background = element_rect(fill = "gray90", color = NA)
+  )
+
+print(campy_ct_plot_baseline_24)
+ggsave("campy_Ct_baseline_vs_24hr.png", 
+       width = 10, height = 8, dpi = 600)
+```
+
+```{r campy_ct_broth_comparison_plot}
+# Plot: Between-broth comparison at 24hr (Ct values)
+campy_ct_plot_broths_24 <- ggplot(campy_ct_24hr, 
+                                   aes(x = reorder(Broth, Ct), y = Ct, fill = Broth)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 3) +
+  scale_y_reverse() +
+  scale_fill_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Campylobacter"), " Ct Values at 24hr: Between-Broth Comparison")),
+    subtitle = "Lower Ct = Higher target amount",
+    x = "Broth Type",
+    y = "Ct Value"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "bold")
+  )
+
+print(campy_ct_plot_broths_24)
+ggsave("campy_Ct_broths_24hr.png", 
+       width = 10, height = 6, dpi = 600)
+```
+
+```{r campy_ct_time_course_plot}
+# Plot: Time course (Ct values)
+campy_ct_time_course_data <- campy_cleaned %>%
+  filter(!is.na(Ct))
+
+campy_ct_plot_time_course <- ggplot(campy_ct_time_course_data, 
+                                     aes(x = Time_hr, y = Ct, 
+                                         color = Broth, group = Broth)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 1, linewidth = 0.8) +
+  geom_jitter(alpha = 0.3, width = 0.3, height = 0, size = 2) +
+  scale_y_reverse() +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Campylobacter"), " Ct Values: Enrichment Testing")),
+    subtitle = "Lower Ct = Higher target; Points = individual replicates, Lines = mean ± SE",
+    x = "Time (hours)",
+    y = "Ct Value",
+    color = "Broth"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+
+print(campy_ct_plot_time_course)
+ggsave("campy_Ct_time_course.png", 
+       width = 10, height = 6, dpi = 600)
+```
+
+### 1.2.4 Campylobacter Dual-Axis and Panel Plots
+
+```{r campy_dual_axis_plot}
+# ============================================================================
+# DUAL-AXIS PLOT: Ct + DNA Concentration
+# ============================================================================
+campy_conc_data <- campy_cleaned %>%
+  filter(!is.na(Ct) & !is.na(`Calc Conc (ng/ul)`))
+
+# Calculate the range for scaling (using log scale for concentration)
+ct_min <- min(campy_conc_data$Ct, na.rm = TRUE)
+ct_max <- max(campy_conc_data$Ct, na.rm = TRUE)
+conc_min <- min(campy_conc_data$`Calc Conc (ng/ul)`, na.rm = TRUE)
+conc_max <- max(campy_conc_data$`Calc Conc (ng/ul)`, na.rm = TRUE)
+
+# Transformation function for concentration to Ct scale (using log scale)
+conc_to_ct <- function(conc) {
+  ct_max - (ct_max - ct_min) * (log10(conc) - log10(conc_min)) / (log10(conc_max) - log10(conc_min))
+}
+
+# Inverse transformation for secondary axis (from Ct to log concentration)
+ct_to_conc <- function(ct) {
+  10^(log10(conc_min) + (ct_max - ct) * (log10(conc_max) - log10(conc_min)) / (ct_max - ct_min))
+}
+
+campy_dual_axis_plot <- ggplot(campy_conc_data, 
+                               aes(x = Time_hr, color = Broth, group = Broth)) +
+  # Ct values (primary axis) - solid lines
+  stat_summary(aes(y = Ct), fun = mean, geom = "line", 
+               linewidth = 1.2, linetype = "solid") +
+  stat_summary(aes(y = Ct), fun = mean, geom = "point", 
+               size = 3, shape = 16) +
+  geom_jitter(aes(y = Ct), alpha = 0.3, width = 0.3, height = 0, 
+              size = 2, shape = 16) +
+  
+  # DNA concentration (secondary axis) - dashed lines with triangles
+  stat_summary(aes(y = conc_to_ct(`Calc Conc (ng/ul)`)), 
+               fun = mean, geom = "line", 
+               linewidth = 1.0, linetype = "dashed", alpha = 0.6) +
+  stat_summary(aes(y = conc_to_ct(`Calc Conc (ng/ul)`)), 
+               fun = mean, geom = "point", 
+               size = 2.5, shape = 17, alpha = 0.6) +
+  geom_jitter(aes(y = conc_to_ct(`Calc Conc (ng/ul)`)), 
+              alpha = 0.2, width = 0.3, height = 0, 
+              size = 1.5, shape = 17) +
+  
+  scale_y_reverse(
+    name = "Ct Value (Lower = More Target)",
+    sec.axis = sec_axis(
+      trans = ~ ct_to_conc(.),
+      name = "DNA Concentration (ng/µl)"
+    )
+  ) +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Campylobacter"), " Enrichment: Ct Values & DNA Concentration")),
+    subtitle = "Solid circles/lines = Ct values | Dashed triangles/lines = DNA concentration (log scale)",
+    x = "Time (hours)",
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    axis.title.y.left = element_text(color = "black", face = "bold"),
+    axis.title.y.right = element_text(color = "gray40", face = "bold"),
+    legend.position = "right"
+  )
+
+print(campy_dual_axis_plot)
+ggsave("campy_dual_axis_time_course.png", 
+       width = 11, height = 6, dpi = 600)
+```
+
+```{r campy_panel_plots, fig.height=8}
+# ============================================================================
+# SEPARATE PANELS PLOT (RECOMMENDED)
+# ============================================================================
+campy_long <- campy_conc_data %>%
+  select(Time_hr, Broth, Ct, `Calc Conc (ng/ul)`) %>%
+  pivot_longer(
+    cols = c(Ct, `Calc Conc (ng/ul)`),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement, 
+                        levels = c("Ct", "Calc Conc (ng/ul)"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µl)"))
+  )
+
+campy_panel_plot <- ggplot(campy_long, 
+                          aes(x = Time_hr, y = Value, 
+                              color = Broth, group = Broth)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 1, linewidth = 0.8) +
+  geom_jitter(alpha = 0.3, width = 0.3, height = 0, size = 2) +
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y", strip.position = "left") +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Campylobacter"), " Enrichment Testing: Ct Values & DNA Concentration")),
+    subtitle = "Each point = qPCR run replicates | Lines = mean ± SE",
+    x = "Time (hours)",
+    y = NULL,
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.placement = "outside",
+    legend.position = "right"
+  )
+
+print(campy_panel_plot)
+ggsave("campy_panels_time_course.png", 
+       width = 10, height = 8, dpi = 600)
+```
+
+```{r campy_panel_sidebyside}
+# ============================================================================
+# SIDE-BY-SIDE PANELS (Alternative layout)
+# ============================================================================
+campy_panel_sidebyside <- ggplot(campy_long, 
+                                aes(x = Time_hr, y = Value, 
+                                    color = Broth, group = Broth)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 1, linewidth = 0.8) +
+  geom_jitter(alpha = 0.3, width = 0.3, height = 0, size = 2) +
+  facet_wrap(~ Measurement, ncol = 2, scales = "free_y") +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Campylobacter"), " Enrichment: Ct Values & DNA Concentration")),
+    subtitle = "Points = individual replicates, Lines = mean ± SE | Y-axes on log scale",
+    x = "Time (hours)",
+    y = NULL,
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom"
+  )
+
+campy_long
+
+print(campy_panel_sidebyside)
+ggsave("campy_panels_sidebyside_time_course.png", 
+       width = 12, height = 6, dpi = 600)
+```
+
+---
+
+## 1.3 Campylobacter Concentration Analysis
+
+### 1.3.1 Within-Broth Statistics (Concentration)
+
+```{r campy_conc_within_broth_stats}
+# Prepare data for baseline vs 24hr comparison
+campy_conc_within_data <- campy_cleaned %>%
+  left_join(campy_baseline_map, by = "Broth") %>%
+  filter(Time_hr %in% c(baseline_hr, 24)) %>%
+  filter(!is.na(Concentration))
+
+# Calculate within-broth statistics
+campy_conc_within_stats <- campy_conc_within_data %>%
+  group_by(Broth, baseline_hr) %>%
+  summarise(
+    n_baseline = sum(Time_hr == baseline_hr),
+    n_24hr = sum(Time_hr == 24),
+    mean_conc_baseline = mean(Concentration[Time_hr == baseline_hr]),
+    sd_conc_baseline = sd(Concentration[Time_hr == baseline_hr]),
+    mean_conc_24hr = mean(Concentration[Time_hr == 24]),
+    sd_conc_24hr = sd(Concentration[Time_hr == 24]),
+    fold_change = mean_conc_24hr / mean_conc_baseline,
+    log2_fold_change = log2(fold_change),
+    p_value = safe_wilcox_test(cur_data(), "Concentration", "Time_hr", unique(baseline_hr), 24),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    comparison = paste0(baseline_hr, "hr vs 24hr"),
+    significant = if_else(!is.na(p_value) & p_value < 0.05, "Yes", "No"),
+    interpretation = interpret_p_value(p_value)
+  )
+
+# Display results
+kable(campy_conc_within_stats %>% 
+        select(Broth, comparison, n_baseline, n_24hr, 
+               mean_conc_baseline, mean_conc_24hr, 
+               fold_change, p_value, significant),
+      caption = "Campylobacter Within-Broth Comparison (Concentration)",
+      digits = c(0, 0, 0, 0, 4, 2, 1, 4, 0)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(campy_conc_within_stats$significant == "Yes"), 
+           bold = TRUE, color = "white", background = "#28a745")
+```
+
+**Detailed Statistical Results (Concentration Analysis):**
+
+```{r campy_conc_individual_broth_results, results='asis'}
+# Print detailed results for each broth
+for (i in 1:nrow(campy_conc_within_stats)) {
+  broth_data <- campy_conc_within_stats[i, ]
+  
+  cat("\n#### **", broth_data$Broth, "Broth (", broth_data$comparison, ")**\n\n", sep = "")
+  cat("- **Sample size:** n =", broth_data$n_baseline, "(baseline), n =", broth_data$n_24hr, "(24hr)\n")
+  cat("- **Mean concentration at baseline:**", format(broth_data$mean_conc_baseline, scientific = TRUE, digits = 3), 
+      "± ", format(broth_data$sd_conc_baseline, scientific = TRUE, digits = 2), "SD ng/µl\n")
+  cat("- **Mean concentration at 24hr:**", format(broth_data$mean_conc_24hr, scientific = TRUE, digits = 3), 
+      "± ", format(broth_data$sd_conc_24hr, scientific = TRUE, digits = 2), "SD ng/µl\n")
+  cat("- **Fold change:**", format(round(broth_data$fold_change, 1), big.mark = ","), 
+      "-fold increase\n")
+  cat("- **Log2 fold change:**", round(broth_data$log2_fold_change, 2), "\n")
+  cat("- **Wilcoxon rank-sum test:** p =", format.pval(broth_data$p_value, digits = 4), "\n")
+  cat("- **Significance:**", broth_data$significant, "-", broth_data$interpretation, "\n")
+  
+  # Add interpretation note
+  if (!is.na(broth_data$fold_change) && broth_data$fold_change > 1) {
+    cat("- **Interpretation:** Concentration increased", 
+        format(round(broth_data$fold_change, 1), big.mark = ","), 
+        "times from baseline to 24hr\n")
+  }
+  cat("\n")
+}
+```
+
+**Key Findings (Concentration Analysis):**
+
+- **BF Bolton Base**: `r format(round(campy_conc_within_stats$fold_change[campy_conc_within_stats$Broth == "BF Bolton Base"], 1), big.mark = ",")`-fold increase (p = `r round(campy_conc_within_stats$p_value[campy_conc_within_stats$Broth == "BF Bolton Base"], 3)`)
+- **BF Bolton Base + CAT**: `r format(round(campy_conc_within_stats$fold_change[campy_conc_within_stats$Broth == "BF Bolton Base + CAT"], 1), big.mark = ",")`-fold increase (p = `r round(campy_conc_within_stats$p_value[campy_conc_within_stats$Broth == "BF Bolton Base + CAT"], 3)`)
+- **BPW**: `r ifelse("BPW" %in% campy_conc_within_stats$Broth, paste0(format(round(campy_conc_within_stats$fold_change[campy_conc_within_stats$Broth == "BPW"], 1), big.mark = ","), "-fold change"), "Insufficient data for analysis")`
+- **RVS**: `r ifelse("RVS" %in% campy_conc_within_stats$Broth, paste0(format(round(campy_conc_within_stats$fold_change[campy_conc_within_stats$Broth == "RVS"], 1), big.mark = ","), "-fold change"), "No detectable signal")`
+
+**Statistical Note:** Small sample sizes (n=3) limit statistical power. Large fold changes indicate biological significance despite p > 0.05.
+
+### 1.3.2 Between-Broth Statistics at 24hr (Concentration)
+
+```{r campy_conc_between_broth_stats}
+# Prepare data for between-broth comparison at 24hr
+campy_conc_24hr <- campy_cleaned %>%
+  filter(Time_hr == 24, !is.na(Concentration))
+
+# Summary by broth
+campy_conc_24hr_summary <- campy_conc_24hr %>%
+  group_by(Broth) %>%
+  summarise(
+    n = n(),
+    mean_conc = mean(Concentration),
+    sd_conc = sd(Concentration),
+    median_conc = median(Concentration),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_conc))
+
+kable(campy_conc_24hr_summary,
+      caption = "Campylobacter Concentration at 24hr (ng/µl)",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Kruskal-Wallis test
+if (n_distinct(campy_conc_24hr$Broth) >= 2) {
+  campy_conc_kw <- kruskal.test(Concentration ~ Broth, data = campy_conc_24hr)
+  cat("\n**Kruskal-Wallis Test:**\n")
+  cat("χ² =", round(campy_conc_kw$statistic, 3), 
+      ", p =", format.pval(campy_conc_kw$p.value, digits = 3), "\n")
+  
+  if (campy_conc_kw$p.value < 0.05) {
+    cat("**Result: Significant differences exist between broths (p < 0.05)**\n")
+  }
+}
+```
+
+---
+
+## 1.4 Campylobacter Summary
+
+### Overall Comparison: All Broths (0hr vs 24hr)
+
+```{r campy_summary_comparison}
+# Comparison table: Ct vs Concentration methods
+campy_comparison <- campy_ct_within_stats %>%
+  select(Broth, 
+         n_Ct = n_24hr,
+         mean_Ct_0hr = mean_Ct_baseline, 
+         mean_Ct_24hr, 
+         delta_Ct,
+         fold_change_ct = fold_change, 
+         p_value_ct = p_value) %>%
+  left_join(
+    campy_conc_within_stats %>%
+      select(Broth, 
+             n_Conc = n_24hr,
+             mean_conc_0hr = mean_conc_baseline,
+             mean_conc_24hr, 
+             fold_change_conc = fold_change, 
+             p_value_conc = p_value),
+    by = "Broth"
+  )
+
+kable(campy_comparison %>%
+        mutate(
+          mean_Ct_0hr = round(mean_Ct_0hr, 2),
+          mean_Ct_24hr = round(mean_Ct_24hr, 2),
+          delta_Ct = round(delta_Ct, 2),
+          fold_change_ct = format(round(fold_change_ct, 0), big.mark = ","),
+          p_value_ct = format.pval(p_value_ct, digits = 3),
+          mean_conc_0hr = format(mean_conc_0hr, scientific = TRUE, digits = 2),
+          mean_conc_24hr = format(mean_conc_24hr, scientific = TRUE, digits = 2),
+          fold_change_conc = format(round(fold_change_conc, 0), big.mark = ","),
+          p_value_conc = format.pval(p_value_conc, digits = 3)
+        ),
+      caption = "Campylobacter: Complete Comparison (Ct and Concentration)",
+      col.names = c("Broth", "n", "Ct 0hr", "Ct 24hr", "ΔCt", "Fold↑ (Ct)", "p-value",
+                    "n", "Conc 0hr", "Conc 24hr", "Fold↑ (Conc)", "p-value")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  add_header_above(c(" " = 1, "Ct Value Analysis" = 6, "Concentration Analysis" = 5))
+```
+
+### Statistical Interpretation by Broth
+
+```{r campy_interpretation_table, results='asis'}
+cat("\n")
+cat("| Broth | Growth Status | ΔCt (cycles) | Fold Change | Significance | Recommendation |\n")
+cat("|-------|---------------|--------------|-------------|--------------|----------------|\n")
+
+for (i in 1:nrow(campy_ct_within_stats)) {
+  broth <- campy_ct_within_stats$Broth[i]
+  delta_ct <- campy_ct_within_stats$delta_Ct[i]
+  fold <- campy_ct_within_stats$fold_change[i]
+  pval <- campy_ct_within_stats$p_value[i]
+  
+  # Determine growth status
+  if (is.na(delta_ct)) {
+    status <- "No detection"
+    recommendation <- "Not suitable"
+  } else if (delta_ct < -15) {
+    status <- "Excellent growth"
+    recommendation <- "**Highly recommended**"
+  } else if (delta_ct < -10) {
+    status <- "Good growth"
+    recommendation <- "**Recommended**"
+  } else if (delta_ct < -5) {
+    status <- "Moderate growth"
+    recommendation <- "Acceptable"
+  } else if (delta_ct < 0) {
+    status <- "Minimal growth"
+    recommendation <- "Limited suitability"
+  } else {
+    status <- "No growth"
+    recommendation <- "Not suitable"
+  }
+  
+  # Significance
+  sig <- ifelse(is.na(pval), "N/A", 
+                ifelse(pval < 0.05, "Yes (p<0.05)", 
+                       paste0("No (p=", round(pval, 2), ")")))
+  
+  cat("| ", broth, " | ", status, " | ", 
+      ifelse(is.na(delta_ct), "N/A", round(delta_ct, 2)), " | ",
+      ifelse(is.na(fold), "N/A", format(round(fold, 0), big.mark = ",")), " | ",
+      sig, " | ", recommendation, " |\n", sep = "")
+}
+```
+
+**Campylobacter Conclusions:**
+
+1. **BF Bolton Base + CAT** shows the best performance for *Campylobacter* enrichment at 24hr
+   - ΔCt: `r round(campy_ct_within_stats$delta_Ct[campy_ct_within_stats$Broth == "BF Bolton Base + CAT"], 2)` cycles (most negative)
+   - `r format(round(campy_ct_within_stats$fold_change[campy_ct_within_stats$Broth == "BF Bolton Base + CAT"], 0), big.mark = ",")` fold increase
+   - **RECOMMENDED for *Campylobacter* enrichment**
+
+2. **BF Bolton Base** shows substantial growth
+   - ΔCt: `r round(campy_ct_within_stats$delta_Ct[campy_ct_within_stats$Broth == "BF Bolton Base"], 2)` cycles
+   - `r format(round(campy_ct_within_stats$fold_change[campy_ct_within_stats$Broth == "BF Bolton Base"], 0), big.mark = ",")` fold increase
+   - **Acceptable alternative**
+
+3. **BPW and RVS** show minimal/no detectable growth
+   - Not suitable for *Campylobacter* enrichment
+
+4. Both Ct and concentration analyses reach the same biological conclusions
+
+5. **Statistical caveat:** Small sample sizes (n=3) limit power to detect significance in within-broth comparisons despite large effect sizes
+
+---
+
+# PART 2: SALMONELLA ANALYSIS
+
+## 2.1 Data Loading and Cleaning
+
+```{r load_salmonella}
+# Read Salmonella data
+salm_raw <- read_excel('/Volumes/Alice/1_METHOD_DEVELOPMENT/Enrichment_testing/Raw_data/qPCR_Salmonella_enrichment-testing.xlsx')
+
+
+# Clean and prepare data
+salm_cleaned <- salm_raw %>%
+  filter(Type == "Unknown") %>%
+  mutate(
+    Broth = str_extract(Name, "^[A-Z-]+"),
+    Time_hr = as.numeric(str_extract(Name, "\\d+(?=hr)")),
+    Ct = as.numeric(Ct),
+    Concentration = as.numeric(`Calc Conc (ng/ul)`)
+  ) %>%
+  filter(Broth %in% c("BF-BB", "CAT", "BPW", "RVS")) %>%
+  select(Name, Broth, Time_hr, Ct, Concentration, `Calc Conc (ng/ul)`)
+
+# Rename broths to full names
+salm_cleaned <- salm_cleaned %>%
+  mutate(Broth = case_when(
+    Broth == "BF-BB" ~ "BF Bolton Base",
+    Broth == "CAT" ~ "BF Bolton Base + CAT",
+    TRUE ~ Broth
+  ))
+
+# Define baseline times for Salmonella
+salm_baseline_map <- tibble(
+  Broth = c("BF Bolton Base", "BF Bolton Base + CAT", "BPW", "RVS"),
+  baseline_hr = c(0, 0, 0, 0)
+)
+```
+
+```{r salm_data_summary}
+# Data summary
+salm_summary <- salm_cleaned %>%
+  group_by(Broth, Time_hr) %>%
+  summarise(
+    n_replicates = n(),
+    n_Ct_detected = sum(!is.na(Ct)),
+    n_Conc_detected = sum(!is.na(Concentration)),
+    mean_Ct = mean(Ct, na.rm = TRUE),
+    mean_Conc = mean(Concentration, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(salm_summary, 
+      caption = "Salmonella Data Summary",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 2.2 Salmonella Ct Value Analysis
+
+### 2.2.1 Within-Broth Statistics (Ct)
+
+```{r salm_ct_within_broth_stats}
+# Prepare data for baseline vs 24hr comparison
+salm_ct_within_data <- salm_cleaned %>%
+  left_join(salm_baseline_map, by = "Broth") %>%
+  filter(Time_hr %in% c(baseline_hr, 24)) %>%
+  filter(!is.na(Ct))
+
+# Calculate within-broth statistics
+salm_ct_within_stats <- salm_ct_within_data %>%
+  group_by(Broth, baseline_hr) %>%
+  summarise(
+    n_baseline = sum(Time_hr == baseline_hr),
+    n_24hr = sum(Time_hr == 24),
+    mean_Ct_baseline = mean(Ct[Time_hr == baseline_hr]),
+    sd_Ct_baseline = sd(Ct[Time_hr == baseline_hr]),
+    mean_Ct_24hr = mean(Ct[Time_hr == 24]),
+    sd_Ct_24hr = sd(Ct[Time_hr == 24]),
+    delta_Ct = mean_Ct_24hr - mean_Ct_baseline,
+    fold_change = 2^(-delta_Ct),
+    p_value = safe_wilcox_test(cur_data(), "Ct", "Time_hr", unique(baseline_hr), 24),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    comparison = paste0(baseline_hr, "hr vs 24hr"),
+    significant = if_else(!is.na(p_value) & p_value < 0.05, "Yes", "No"),
+    interpretation = interpret_p_value(p_value)
+  )
+
+# Display results
+kable(salm_ct_within_stats %>% 
+        select(Broth, comparison, n_baseline, n_24hr, 
+               mean_Ct_baseline, mean_Ct_24hr, delta_Ct, 
+               fold_change, p_value, significant),
+      caption = "Salmonella Within-Broth Comparison (Ct Values)",
+      digits = c(0, 0, 0, 0, 2, 2, 2, 1, 4, 0)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(salm_ct_within_stats$significant == "Yes"), 
+           bold = TRUE, color = "white", background = "#28a745")
+```
+
+### 2.2.2 Between-Broth Statistics at 24hr (Ct)
+
+```{r salm_ct_between_broth_stats}
+# Prepare data for between-broth comparison at 24hr
+salm_ct_24hr <- salm_cleaned %>%
+  filter(Time_hr == 24, !is.na(Ct))
+
+# Summary by broth
+salm_ct_24hr_summary <- salm_ct_24hr %>%
+  group_by(Broth) %>%
+  summarise(
+    n = n(),
+    mean_Ct = mean(Ct),
+    sd_Ct = sd(Ct),
+    median_Ct = median(Ct),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_Ct)
+
+kable(salm_ct_24hr_summary,
+      caption = "Salmonella Ct Values at 24hr (Lower Ct = More target)",
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Kruskal-Wallis test
+if (n_distinct(salm_ct_24hr$Broth) >= 2) {
+  salm_ct_kw <- kruskal.test(Ct ~ Broth, data = salm_ct_24hr)
+  cat("\n**Kruskal-Wallis Test:**\n")
+  cat("χ² =", round(salm_ct_kw$statistic, 3), 
+      ", p =", format.pval(salm_ct_kw$p.value, digits = 3), "\n")
+  
+  if (salm_ct_kw$p.value < 0.05) {
+    cat("**Result: Significant differences exist between broths (p < 0.05)**\n")
+  }
+}
+```
+
+### 2.2.3 Salmonella Ct Plots
+
+```{r salm_ct_baseline_vs_24hr_plot, fig.height=8}
+# Plot: Baseline vs 24hr (Ct values)
+salm_ct_plot_baseline_24 <- ggplot(salm_ct_within_data, 
+                                     aes(x = factor(Time_hr), y = Ct, 
+                                         fill = factor(Time_hr))) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 2.5) +
+  facet_wrap(~Broth, scales = "free_y", ncol = 2) +
+  scale_y_reverse() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = expression(paste(italic("Salmonella"), " Ct Values: Baseline vs 24hr Comparison")),
+    subtitle = "Lower Ct = Higher target amount",
+    x = "Time Point (hours)",
+    y = "Ct Value",
+    fill = "Time Point"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 11),
+    strip.background = element_rect(fill = "gray90", color = NA)
+  )
+
+print(salm_ct_plot_baseline_24)
+ggsave("salm_Ct_baseline_vs_24hr.png", 
+       width = 10, height = 8, dpi = 600)
+```
+
+```{r salm_ct_broth_comparison_plot}
+# Plot: Between-broth comparison at 24hr (Ct values)
+salm_ct_plot_broths_24 <- ggplot(salm_ct_24hr, 
+                                   aes(x = reorder(Broth, Ct), y = Ct, fill = Broth)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 3) +
+  scale_y_reverse() +
+  scale_fill_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Salmonella"), " Ct Values at 24hr: Between-Broth Comparison")),
+    subtitle = "Lower Ct = Higher target amount",
+    x = "Broth Type",
+    y = "Ct Value"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "bold")
+  )
+
+print(salm_ct_plot_broths_24)
+ggsave("salm_Ct_broths_24hr.png", 
+       width = 10, height = 6, dpi = 600)
+```
+
+```{r salm_ct_time_course_plot}
+# Plot: Time course (Ct values)
+salm_ct_time_course_data <- salm_cleaned %>%
+  filter(!is.na(Ct))
+
+salm_ct_plot_time_course <- ggplot(salm_ct_time_course_data, 
+                                     aes(x = Time_hr, y = Ct, 
+                                         color = Broth, group = Broth)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 1, linewidth = 0.8) +
+  geom_jitter(alpha = 0.3, width = 0.3, height = 0, size = 2) +
+  scale_y_reverse() +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Salmonella"), " Ct Values: Enrichment Testing")),
+    subtitle = "Lower Ct = Higher target; Points = individual replicates, Lines = mean ± SE",
+    x = "Time (hours)",
+    y = "Ct Value",
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+
+print(salm_ct_plot_time_course)
+ggsave("salm_Ct_time_course.png", 
+       width = 10, height = 6, dpi = 600)
+```
+
+### 2.2.4 Salmonella Dual-Axis and Panel Plots
+
+```{r salm_dual_axis_plot}
+# ============================================================================
+# DUAL-AXIS PLOT: Ct + DNA Concentration
+# ============================================================================
+salm_conc_data <- salm_cleaned %>%
+  filter(!is.na(Ct) & !is.na(`Calc Conc (ng/ul)`))
+
+# Calculate the range for scaling (using log scale for concentration)
+ct_min <- min(salm_conc_data$Ct, na.rm = TRUE)
+ct_max <- max(salm_conc_data$Ct, na.rm = TRUE)
+conc_min <- min(salm_conc_data$`Calc Conc (ng/ul)`, na.rm = TRUE)
+conc_max <- max(salm_conc_data$`Calc Conc (ng/ul)`, na.rm = TRUE)
+
+# Transformation function for concentration to Ct scale (using log scale)
+conc_to_ct <- function(conc) {
+  ct_max - (ct_max - ct_min) * (log10(conc) - log10(conc_min)) / (log10(conc_max) - log10(conc_min))
+}
+
+# Inverse transformation for secondary axis (from Ct to log concentration)
+ct_to_conc <- function(ct) {
+  10^(log10(conc_min) + (ct_max - ct) * (log10(conc_max) - log10(conc_min)) / (ct_max - ct_min))
+}
+
+salm_dual_axis_plot <- ggplot(salm_conc_data, 
+                               aes(x = Time_hr, color = Broth, group = Broth)) +
+  # Ct values (primary axis) - solid lines
+  stat_summary(aes(y = Ct), fun = mean, geom = "line", 
+               linewidth = 1.2, linetype = "solid") +
+  stat_summary(aes(y = Ct), fun = mean, geom = "point", 
+               size = 3, shape = 16) +
+  geom_jitter(aes(y = Ct), alpha = 0.3, width = 0.3, height = 0, 
+              size = 2, shape = 16) +
+  
+  # DNA concentration (secondary axis) - dashed lines with triangles
+  stat_summary(aes(y = conc_to_ct(`Calc Conc (ng/ul)`)), 
+               fun = mean, geom = "line", 
+               linewidth = 1.0, linetype = "dashed", alpha = 0.6) +
+  stat_summary(aes(y = conc_to_ct(`Calc Conc (ng/ul)`)), 
+               fun = mean, geom = "point", 
+               size = 2.5, shape = 17, alpha = 0.6) +
+  geom_jitter(aes(y = conc_to_ct(`Calc Conc (ng/ul)`)), 
+              alpha = 0.2, width = 0.3, height = 0, 
+              size = 1.5, shape = 17) +
+  
+  scale_y_reverse(
+    name = "Ct Value (Lower = More Target)",
+    sec.axis = sec_axis(
+      trans = ~ ct_to_conc(.),
+      name = "DNA Concentration (ng/µl)"
+    )
+  ) +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Salmonella"), " Enrichment: Ct Values & DNA Concentration")),
+    subtitle = "Solid circles/lines = Ct values | Dashed triangles/lines = DNA concentration (log scale)",
+    x = "Time (hours)",
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    axis.title.y.left = element_text(color = "black", face = "bold"),
+    axis.title.y.right = element_text(color = "gray40", face = "bold"),
+    legend.position = "right"
+  )
+
+print(salm_dual_axis_plot)
+ggsave("salm_dual_axis_time_course.png", 
+       width = 11, height = 6, dpi = 600)
+```
+
+```{r salm_panel_plots, fig.height=8}
+# ============================================================================
+# SEPARATE PANELS PLOT (RECOMMENDED)
+# ============================================================================
+salm_long <- salm_conc_data %>%
+  select(Time_hr, Broth, Ct, `Calc Conc (ng/ul)`) %>%
+  pivot_longer(
+    cols = c(Ct, `Calc Conc (ng/ul)`),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement, 
+                        levels = c("Ct", "Calc Conc (ng/ul)"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µl)(log10 scale)"))
+  )
+
+salm_panel_plot <- ggplot(salm_long, 
+                          aes(x = Time_hr, y = Value, 
+                              color = Broth, group = Broth)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 1, linewidth = 0.8) +
+  geom_jitter(alpha = 0.3, width = 0.3, height = 0, size = 2) +
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y", strip.position = "left") +
+  scale_y_log10() +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Salmonella"), " Enrichment Testing: Ct Values & DNA Concentration")),
+    subtitle = "Each point = qPCR run replicates | Lines = mean ± SE | DNA concentration on log scale",
+    x = "Time (hours)",
+    y = NULL,
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.placement = "outside",
+    legend.position = "right"
+  )
+
+print(salm_panel_plot)
+ggsave("salm_panels_time_course.png", 
+       width = 10, height = 8, dpi = 600)
+```
+
+```{r salm_panel_sidebyside}
+# ============================================================================
+# SIDE-BY-SIDE PANELS (Alternative layout)
+# ============================================================================
+salm_panel_sidebyside <- ggplot(salm_long, 
+                                aes(x = Time_hr, y = Value, 
+                                    color = Broth, group = Broth)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 1, linewidth = 0.8) +
+  geom_jitter(alpha = 0.3, width = 0.3, height = 0, size = 2) +
+  facet_wrap(~ Measurement, ncol = 2, scales = "free_y") +
+  scale_y_log10() +
+  scale_x_continuous(breaks = c(0, 4, 8, 12, 24),
+                     labels = c("0", "4", "8", "12", "24")) +
+  scale_color_manual(values = c("BF Bolton Base" = "#F8766D", 
+                                "BF Bolton Base + CAT" = "#7CAE00",
+                                "BPW" = "#00BFC4",
+                                "RVS" = "#C77CFF")) +
+  labs(
+    title = expression(paste(italic("Salmonella"), " Enrichment: Ct Values & DNA Concentration")),
+    subtitle = "Points = individual replicates, Lines = mean ± SE | Y-axes on log scale",
+    x = "Time (hours)",
+    y = NULL,
+    color = "Broth"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom"
+  )
+
+print(salm_panel_sidebyside)
+ggsave("salm_panels_sidebyside_time_course.png", 
+       width = 12, height = 6, dpi = 600)
+```
+
+---
+
+## 2.3 Salmonella Concentration Analysis
+
+### 2.3.1 Within-Broth Statistics (Concentration)
+
+```{r salm_conc_within_broth_stats}
+# Prepare data for baseline vs 24hr comparison
+salm_conc_within_data <- salm_cleaned %>%
+  left_join(salm_baseline_map, by = "Broth") %>%
+  filter(Time_hr %in% c(baseline_hr, 24)) %>%
+  filter(!is.na(Concentration))
+
+# Calculate within-broth statistics
+salm_conc_within_stats <- salm_conc_within_data %>%
+  group_by(Broth, baseline_hr) %>%
+  summarise(
+    n_baseline = sum(Time_hr == baseline_hr),
+    n_24hr = sum(Time_hr == 24),
+    mean_conc_baseline = mean(Concentration[Time_hr == baseline_hr]),
+    sd_conc_baseline = sd(Concentration[Time_hr == baseline_hr]),
+    mean_conc_24hr = mean(Concentration[Time_hr == 24]),
+    sd_conc_24hr = sd(Concentration[Time_hr == 24]),
+    fold_change = mean_conc_24hr / mean_conc_baseline,
+    log2_fold_change = log2(fold_change),
+    p_value = safe_wilcox_test(cur_data(), "Concentration", "Time_hr", unique(baseline_hr), 24),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    comparison = paste0(baseline_hr, "hr vs 24hr"),
+    significant = if_else(!is.na(p_value) & p_value < 0.05, "Yes", "No"),
+    interpretation = interpret_p_value(p_value)
+  )
+
+# Display results
+kable(salm_conc_within_stats %>% 
+        select(Broth, comparison, n_baseline, n_24hr, 
+               mean_conc_baseline, mean_conc_24hr, 
+               fold_change, p_value, significant),
+      caption = "Salmonella Within-Broth Comparison (Concentration)",
+      digits = c(0, 0, 0, 0, 4, 2, 1, 4, 0)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(salm_conc_within_stats$significant == "Yes"), 
+           bold = TRUE, color = "white", background = "#28a745")
+```
+
+### 2.3.2 Between-Broth Statistics at 24hr (Concentration)
+
+```{r salm_conc_between_broth_stats}
+# Prepare data for between-broth comparison at 24hr
+salm_conc_24hr <- salm_cleaned %>%
+  filter(Time_hr == 24, !is.na(Concentration))
+
+# Summary by broth
+salm_conc_24hr_summary <- salm_conc_24hr %>%
+  group_by(Broth) %>%
+  summarise(
+    n = n(),
+    mean_conc = mean(Concentration),
+    sd_conc = sd(Concentration),
+    median_conc = median(Concentration),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_conc))
+
+kable(salm_conc_24hr_summary,
+      caption = "Salmonella Concentration at 24hr (ng/µl)",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Kruskal-Wallis test
+if (n_distinct(salm_conc_24hr$Broth) >= 2) {
+  salm_conc_kw <- kruskal.test(Concentration ~ Broth, data = salm_conc_24hr)
+  cat("\n**Kruskal-Wallis Test:**\n")
+  cat("χ² =", round(salm_conc_kw$statistic, 3), 
+      ", p =", format.pval(salm_conc_kw$p.value, digits = 3), "\n")
+  
+  if (salm_conc_kw$p.value < 0.05) {
+    cat("**Result: Significant differences exist between broths (p < 0.05)**\n")
+  }
+}
+```
+
+---
+
+## 2.4 Salmonella Summary
+
+### Overall Comparison: All Broths (0hr vs 24hr)
+
+```{r salm_summary_comparison}
+# Comparison table: Ct vs Concentration methods
+salm_comparison <- salm_ct_within_stats %>%
+  select(Broth, 
+         n_Ct = n_24hr,
+         mean_Ct_0hr = mean_Ct_baseline, 
+         mean_Ct_24hr, 
+         delta_Ct,
+         fold_change_ct = fold_change, 
+         p_value_ct = p_value) %>%
+  left_join(
+    salm_conc_within_stats %>%
+      select(Broth, 
+             n_Conc = n_24hr,
+             mean_conc_0hr = mean_conc_baseline,
+             mean_conc_24hr, 
+             fold_change_conc = fold_change, 
+             p_value_conc = p_value),
+    by = "Broth"
+  )
+
+kable(salm_comparison %>%
+        mutate(
+          mean_Ct_0hr = round(mean_Ct_0hr, 2),
+          mean_Ct_24hr = round(mean_Ct_24hr, 2),
+          delta_Ct = round(delta_Ct, 2),
+          fold_change_ct = format(round(fold_change_ct, 0), big.mark = ","),
+          p_value_ct = format.pval(p_value_ct, digits = 3),
+          mean_conc_0hr = format(mean_conc_0hr, scientific = TRUE, digits = 2),
+          mean_conc_24hr = format(mean_conc_24hr, scientific = TRUE, digits = 2),
+          fold_change_conc = format(round(fold_change_conc, 0), big.mark = ","),
+          p_value_conc = format.pval(p_value_conc, digits = 3)
+        ),
+      caption = "Salmonella: Complete Comparison (Ct and Concentration)",
+      col.names = c("Broth", "n", "Ct 0hr", "Ct 24hr", "ΔCt", "Fold↑ (Ct)", "p-value",
+                    "n", "Conc 0hr", "Conc 24hr", "Fold↑ (Conc)", "p-value")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  add_header_above(c(" " = 1, "Ct Value Analysis" = 6, "Concentration Analysis" = 5))
+```
+
+### Statistical Interpretation by Broth
+
+```{r salm_interpretation_table, results='asis'}
+cat("\n")
+cat("| Broth | Growth Status | ΔCt (cycles) | Fold Change | Significance | Recommendation |\n")
+cat("|-------|---------------|--------------|-------------|--------------|----------------|\n")
+
+for (i in 1:nrow(salm_ct_within_stats)) {
+  broth <- salm_ct_within_stats$Broth[i]
+  delta_ct <- salm_ct_within_stats$delta_Ct[i]
+  fold <- salm_ct_within_stats$fold_change[i]
+  pval <- salm_ct_within_stats$p_value[i]
+  
+  # Determine growth status
+  if (is.na(delta_ct)) {
+    status <- "No detection"
+    recommendation <- "Not suitable"
+  } else if (delta_ct < -15) {
+    status <- "Excellent growth"
+    recommendation <- "**Highly recommended**"
+  } else if (delta_ct < -10) {
+    status <- "Good growth"
+    recommendation <- "**Recommended**"
+  } else if (delta_ct < -5) {
+    status <- "Moderate growth"
+    recommendation <- "Acceptable"
+  } else if (delta_ct < 0) {
+    status <- "Minimal growth"
+    recommendation <- "Limited suitability"
+  } else {
+    status <- "No growth"
+    recommendation <- "Not suitable"
+  }
+  
+  # Significance
+  sig <- ifelse(is.na(pval), "N/A", 
+                ifelse(pval < 0.05, "Yes (p<0.05)", 
+                       paste0("No (p=", round(pval, 2), ")")))
+  
+  cat("| ", broth, " | ", status, " | ", 
+      ifelse(is.na(delta_ct), "N/A", round(delta_ct, 2)), " | ",
+      ifelse(is.na(fold), "N/A", format(round(fold, 0), big.mark = ",")), " | ",
+      sig, " | ", recommendation, " |\n", sep = "")
+}
+```
+---
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```

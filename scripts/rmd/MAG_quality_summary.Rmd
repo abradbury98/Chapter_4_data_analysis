@@ -1,0 +1,454 @@
+---
+title: "MAG Quality Summary"
+output:
+  html_document:
+    fig_width: 14
+    fig_height: 10
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(patchwork)
+```
+
+```{r load-data}
+files <- list(
+  ASC_RVS  = "/Users/alicebradbury/Desktop/ASC_RVS_summary_checkm2_gtdbtk.tsv",
+  EVI_RVS  = "/Users/alicebradbury/Desktop/EVI_RVS_summary_checkm2_gtdbtk.tsv",
+  ASC_BFBB = "/Users/alicebradbury/Desktop/ASC_BFBB_summary_checkm2_gtdbtk.tsv",
+  EVI_BFBB = "/Users/alicebradbury/Desktop/EVI_BFBB_summary_checkm2_gtdbtk.tsv"
+)
+
+dat <- map_dfr(files, read_tsv, .id = "dataset") %>%
+  mutate(
+    # Decode sampling location and enrichment type from dataset name
+    sampling_location = factor(
+      case_when(
+        str_detect(dataset, "EVI") ~ "Post-EVI",
+        str_detect(dataset, "ASC") ~ "Post-ASC"
+      ),
+      levels = c("Post-EVI", "Post-ASC")   # EVI first as requested
+    ),
+    enrichment_type = factor(
+      case_when(
+        str_detect(dataset, "RVS")  ~ "BPW + RVS",
+        str_detect(dataset, "BFBB") ~ "BF Bolton Base + CAT"
+      ),
+      levels = c("BPW + RVS", "BF Bolton Base + CAT")  # RVS first as requested
+    ),
+    # Extract species label from full GTDB-Tk string
+    species_raw = case_when(
+      gtdbtk_classification %in% c("Unclassified", "Unclassified Bacteria", "Unclassified Archaea") ~
+        gtdbtk_classification,
+      str_detect(gtdbtk_classification, "s__") ~
+        str_extract(gtdbtk_classification, "(?<=s__).*"),
+      TRUE ~ gtdbtk_classification
+    ),
+    # Simplify blank species
+    species_raw = if_else(species_raw == "" | is.na(species_raw), "Unclassified", species_raw),
+    # Collapse all "Unclassified*" variants
+    classification_group = case_when(
+      str_starts(species_raw, "Unclassified") ~ "Unclassified",
+      TRUE ~ species_raw
+    )
+  )
+```
+
+```{r colour-palette}
+# Identify top classified species by bin count (for legible legend)
+top_species <- dat %>%
+  filter(classification_group != "Unclassified") %>%
+  count(classification_group, sort = TRUE) %>%
+  slice_head(n = 20) %>%
+  pull(classification_group)
+
+# Recode rare classified species as "Other classified"
+dat <- dat %>%
+  mutate(
+    colour_group = case_when(
+      classification_group == "Unclassified" ~ "Unclassified",
+      classification_group %in% top_species    ~ classification_group,
+      TRUE                                     ~ "Other classified"
+    ),
+    colour_group = fct_relevel(colour_group, "Unclassified", "Other classified")
+  )
+
+# Build palette: grey for Unclassified, mid-grey for Other, named colours for species
+n_species <- length(top_species)
+species_colours <- setNames(
+  hue_pal()(n_species),
+  top_species
+)
+full_palette <- c(
+  "Unclassified"   = "grey70",
+  "Other classified" = "grey40",
+  species_colours
+)
+```
+
+## Publication-style quality figure
+
+Panel **a** shows all MAGs coloured by contamination level (blue = low, red = high). Panel **b** shows quality-filtered MAGs (completeness ≥ 50 %, contamination ≤ 10 %) coloured by completeness (warm = lower, cool = higher). Contamination y-axis is log-scaled; zero-contamination bins are floored to 0.005 % to remain visible.
+
+```{r pub-figure, fig.height=5, fig.width=12}
+# Floor 0 contamination so it appears on the log axis
+dat_log <- dat %>%
+  mutate(contamination_plot = pmax(contamination, 0.005))
+
+dat_hq_pub <- dat_log %>%
+  filter(completeness >= 50, contamination <= 10)
+
+n_all <- nrow(dat_log)
+n_hq  <- nrow(dat_hq_pub)
+
+# Shared axis scales
+shared_x <- scale_x_continuous(
+  limits = c(0, 100), breaks = seq(0, 100, 25),
+  expand = expansion(mult = c(0.02, 0.02)),
+  name = "Completeness (%)"
+)
+
+shared_y <- scale_y_log10(
+  limits = c(0.004, 200),
+  breaks = c(0.01, 0.1, 1, 10, 100),
+  labels = c("0.01%", "0.1%", "1%", "10%", "100%"),
+  expand = expansion(mult = c(0, 0.05)),
+  name = "Contamination (%)"
+)
+
+# Shared minimal theme
+theme_pub <- theme_classic(base_size = 12) +
+  theme(
+    plot.title       = element_text(size = 11, hjust = 0.5),
+    legend.position  = "top",
+    legend.key.width = unit(1.8, "cm"),
+    legend.key.height = unit(0.35, "cm"),
+    legend.title     = element_text(size = 9),
+    legend.text      = element_text(size = 8),
+    axis.text        = element_text(size = 9),
+    axis.title       = element_text(size = 10)
+  )
+
+# Dashed threshold lines (x = completeness axis, y = contamination log axis)
+hq_vline <- geom_vline(xintercept = 95,  linetype = "dashed", colour = "grey40", linewidth = 0.6)
+hq_hline <- geom_hline(yintercept = 10,  linetype = "dashed", colour = "grey40", linewidth = 0.6)
+
+# Panel a — all MAGs, coloured by contamination
+p_a <- ggplot(dat_log,
+              aes(x = completeness, y = contamination_plot,
+                  colour = contamination_plot)) +
+  hq_vline + hq_hline +
+  geom_point(alpha = 0.5, size = 1.2, shape = 16) +
+  shared_x + shared_y +
+  scale_colour_gradientn(
+    colours  = c("royalblue4", "royalblue", "dodgerblue",
+                 "lightyellow", "orange", "red", "darkred"),
+    trans    = "log10",
+    limits   = c(0.005, 200),
+    breaks   = c(0.01, 0.1, 1, 10, 100),
+    labels   = c("0.01%", "0.1%", "1%", "10%", "100%"),
+    name     = "Contamination",
+    guide    = guide_colorbar(
+      title.position = "top", title.hjust = 0.5,
+      barwidth = 8, barheight = 0.5
+    )
+  ) +
+  labs(title = paste0("All MAGs (", format(n_all, big.mark = ","), ")")) +
+  theme_pub
+
+# Panel b — quality-filtered MAGs, coloured by completeness
+p_b <- ggplot(dat_hq_pub,
+              aes(x = completeness, y = contamination_plot,
+                  colour = completeness)) +
+  hq_vline + hq_hline +
+  geom_point(alpha = 0.5, size = 1.2, shape = 16) +
+  shared_x + shared_y +
+  scale_colour_gradientn(
+    colours = c("#C17D00", "#9E8C7A", "#6A8FC4", "royalblue4"),
+    limits  = c(50, 100),
+    breaks  = c(50, 75, 100),
+    labels  = c("50%", "75%", "100%"),
+    name    = "Completeness",
+    guide   = guide_colorbar(
+      title.position = "top", title.hjust = 0.5,
+      barwidth = 8, barheight = 0.5
+    )
+  ) +
+  labs(title = paste0("High-quality filtered MAGs (", format(n_hq, big.mark = ","), ")")) +
+  theme_pub
+
+# Combine with a/b tags
+fig_pub <- p_a + p_b +
+  plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(face = "bold", size = 14))
+
+fig_pub
+
+ggsave("~/Desktop/MAG_quality_pub_figure.png", fig_pub,
+       width = 12, height = 5, dpi = 600, bg = "white")
+```
+
+---
+
+## All MAGs combined
+
+All bins across all four datasets and all three binning tools in a single panel. Shape encodes sampling location; fill encodes enrichment type. Reference lines mark common quality thresholds (completeness ≥ 50 % / ≥ 90 %, contamination ≤ 5 % / ≤ 10 %).
+
+```{r all-combined, fig.height=7, fig.width=11}
+# Note: x-axis is reversed contamination, y-axis is completeness
+fig_combined <- ggplot(dat, aes(x = contamination, y = completeness, colour = colour_group,
+                shape = sampling_location)) +
+  geom_vline(xintercept = 10, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_hline(yintercept = 95, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_point(
+    data = filter(dat, colour_group == "Unclassified"),
+    alpha = 0.3, size = 1.5
+  ) +
+  geom_point(
+    data = filter(dat, colour_group == "Other classified"),
+    alpha = 0.55, size = 2
+  ) +
+  geom_point(
+    data = filter(dat, !colour_group %in% c("Unclassified", "Other classified")),
+    alpha = 0.9, size = 2.5
+  ) +
+  scale_colour_manual(values = full_palette, name = "Species / classification") +
+  scale_shape_manual(values = c("Post-EVI" = 16, "Post-ASC" = 17),
+                     name = "Sampling location") +
+  scale_x_reverse(limits = c(NA, 0), breaks = seq(0, 100, 25),
+                  expand = expansion(mult = c(0.05, 0))) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25)) +
+  labs(
+    x = "Contamination (%)",
+    y = "Completeness (%)",
+    title = "MAG quality: all datasets combined",
+    subtitle = "Dashed lines = high quality thresholds (completeness ≥ 95%, contamination ≤ 10%)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position   = "right",
+    legend.key.size   = unit(0.45, "cm"),
+    legend.text       = element_text(size = 7.5),
+    legend.title      = element_text(size = 9, face = "bold"),
+    panel.grid.minor  = element_blank()
+  ) +
+  guides(
+    colour = guide_legend(ncol = 1, override.aes = list(size = 3, alpha = 1, shape = 16)),
+    shape  = guide_legend(override.aes = list(size = 3, colour = "grey40"))
+  )
+
+fig_combined
+
+ggsave("~/Desktop/MAG_quality_all_combined.png", fig_combined,
+       width = 11, height = 7, dpi = 600, bg = "white")
+```
+
+## Completeness vs contamination — by sampling location and enrichment type
+
+Points are all bins across all three binning tools (concoct, maxbin2, metabat2). Rows = sampling location (Post-EVI / Post-ASC); columns = enrichment type. Reference lines mark common quality thresholds (completeness ≥ 50 % / ≥ 90 %, contamination ≤ 5 % / ≤ 10 %).
+
+```{r main-plot, fig.height=10, fig.width=14}
+fig_faceted <- ggplot(dat, aes(x = contamination, y = completeness, colour = colour_group)) +
+  geom_vline(xintercept = 10, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_hline(yintercept = 95, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_point(
+    data = filter(dat, colour_group == "Unclassified"),
+    alpha = 0.4, size = 1.5, shape = 16
+  ) +
+  geom_point(
+    data = filter(dat, colour_group == "Other classified"),
+    alpha = 0.6, size = 2, shape = 16
+  ) +
+  geom_point(
+    data = filter(dat, !colour_group %in% c("Unclassified", "Other classified")),
+    alpha = 0.85, size = 2.5, shape = 16
+  ) +
+  scale_colour_manual(values = full_palette, name = "Species / classification") +
+  scale_x_reverse(limits = c(NA, 0), breaks = seq(0, 100, 25),
+                  expand = expansion(mult = c(0.05, 0))) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25)) +
+  facet_grid(sampling_location ~ enrichment_type) +
+  labs(
+    x = "Contamination (%)",
+    y = "Completeness (%)",
+    title = "MAG quality: completeness vs contamination",
+    subtitle = "Dashed lines = high quality thresholds (completeness ≥ 95%, contamination ≤ 10%)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position   = "right",
+    legend.key.size   = unit(0.45, "cm"),
+    legend.text       = element_text(size = 7.5),
+    legend.title      = element_text(size = 9, face = "bold"),
+    strip.background  = element_rect(fill = "grey92"),
+    strip.text.x      = element_text(face = "bold", size = 11),
+    strip.text.y      = element_text(face = "bold", size = 11, angle = 0),
+    panel.grid.minor  = element_blank()
+  ) +
+  guides(colour = guide_legend(
+    ncol = 1, override.aes = list(size = 3, alpha = 1)
+  ))
+
+fig_faceted
+
+ggsave("~/Desktop/MAG_quality_faceted.png", fig_faceted,
+       width = 14, height = 10, dpi = 600, bg = "white")
+```
+
+## Classified MAGs only (completeness ≥ 50%)
+
+Zoomed to bins that are at least 50 % complete and have a GTDB-Tk species assignment — these are the most informative MAGs.
+
+```{r classified-hq, fig.height=10, fig.width=14}
+dat_hq <- dat %>%
+  filter(completeness >= 50, colour_group != "Unclassified")
+
+fig_hq <- ggplot(dat_hq, aes(x = contamination, y = completeness, colour = colour_group)) +
+  geom_vline(xintercept = 10, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_hline(yintercept = 95, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_point(alpha = 0.85, size = 3, shape = 16) +
+  geom_text(
+    aes(label = species_raw),
+    size = 2.5, hjust = 1.1, vjust = 0.5,
+    show.legend = FALSE, check_overlap = TRUE
+  ) +
+  scale_colour_manual(values = full_palette, name = "Species") +
+  scale_x_reverse(limits = c(NA, 0), breaks = seq(0, 100, 10),
+                  expand = expansion(mult = c(0.15, 0))) +
+  scale_y_continuous(limits = c(45, 105), breaks = seq(50, 100, 10)) +
+  facet_grid(sampling_location ~ enrichment_type) +
+  labs(
+    x = "Contamination (%)",
+    y = "Completeness (%)",
+    title = "High-quality classified MAGs (completeness ≥ 50%)",
+    subtitle = "Dashed lines = high quality thresholds (completeness ≥ 95%, contamination ≤ 10%); labels show species assignment"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position   = "right",
+    legend.key.size   = unit(0.45, "cm"),
+    legend.text       = element_text(size = 7.5),
+    legend.title      = element_text(size = 9, face = "bold"),
+    strip.background  = element_rect(fill = "grey92"),
+    strip.text.x      = element_text(face = "bold", size = 11),
+    strip.text.y      = element_text(face = "bold", size = 11, angle = 0),
+    panel.grid.minor  = element_blank()
+  ) +
+  guides(colour = guide_legend(
+    ncol = 1, override.aes = list(size = 3, alpha = 1)
+  ))
+
+fig_hq
+
+ggsave("~/Desktop/MAG_quality_hq_classified.png", fig_hq,
+       width = 14, height = 10, dpi = 600, bg = "white")
+```
+
+## High-quality MAGs (completeness ≥ 95%, contamination ≤ 10%)
+
+MAGs meeting the strict high-quality threshold, faceted by sampling location and enrichment type, colour-coded by species classification.
+
+```{r hq-strict-plot, fig.height=10, fig.width=14}
+dat_strict_hq <- dat %>%
+  filter(completeness >= 95, contamination <= 10)
+
+# Build a palette specific to species present in this filtered set
+hq_species <- dat_strict_hq %>%
+  filter(colour_group != "Unclassified") %>%
+  pull(colour_group) %>%
+  unique() %>%
+  sort()
+
+n_hq_sp <- length(hq_species)
+hq_palette <- c(
+  "Unclassified"    = "grey70",
+  "Other classified" = "grey40",
+  setNames(hue_pal()(n_hq_sp), hq_species)
+)
+
+# Jitter with fixed seed for reproducibility
+jitter_pos <- position_jitter(width = 0.35, height = 0.2, seed = 42)
+
+fig_strict_hq <- ggplot(dat_strict_hq,
+                        aes(x = contamination, y = completeness,
+                            fill = colour_group)) +
+  # shape 21 = filled circle with border; white stroke separates overlapping points
+  geom_point(position = jitter_pos,
+             shape = 21, size = 4.5, stroke = 0.6,
+             colour = "white", alpha = 0.92) +
+  scale_fill_manual(values = hq_palette, name = "Species") +
+  scale_x_reverse(limits = c(10, 0), breaks = seq(0, 10, 2),
+                  expand = expansion(mult = c(0.05, 0.02))) +
+  scale_y_continuous(
+    limits = c(93, 100),
+    breaks = seq(94, 100, 2),
+    expand = expansion(add = c(0, 0.8))
+  ) +
+  facet_grid(sampling_location ~ enrichment_type) +
+  labs(
+    x     = "Contamination (%)",
+    y     = "Completeness (%)",
+    title = "High-quality MAGs (completeness ≥ 95%, contamination ≤ 10%)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position   = "right",
+    legend.key.size   = unit(0.55, "cm"),
+    legend.text       = element_text(size = 9),
+    legend.title      = element_text(size = 10, face = "bold"),
+    strip.background  = element_rect(fill = "grey92"),
+    strip.text.x      = element_text(face = "bold", size = 11),
+    strip.text.y      = element_text(face = "bold", size = 11, angle = 0),
+    panel.grid.minor  = element_blank(),
+    panel.grid.major  = element_line(colour = "grey90")
+  ) +
+  guides(fill = guide_legend(ncol = 1, override.aes = list(size = 5, stroke = 0.6,
+                                                            colour = "white")))
+
+fig_strict_hq
+
+ggsave("~/Desktop/MAG_quality_strict_hq.png", fig_strict_hq,
+       width = 14, height = 10, dpi = 600, bg = "white")
+```
+
+## High-quality MAG table
+
+```{r hq-strict-table}
+dat_strict_hq %>%
+  transmute(
+    "Sampling location" = sampling_location,
+    "Enrichment type"   = enrichment_type,
+    "Binning tool"      = tool,
+    "Bin"               = bin,
+    "Completeness (%)"  = round(completeness, 2),
+    "Contamination (%)" = round(contamination, 2),
+    "Classification"    = species_raw
+  ) %>%
+  arrange(`Sampling location`, `Enrichment type`, `Binning tool`, `Bin`) %>%
+  knitr::kable(
+    caption = paste0(
+      "All MAGs with completeness ≥ 95% and contamination ≤ 10% (n = ",
+      nrow(dat_strict_hq), ")"
+    )
+  )
+```
+
+## Summary table — bins per dataset by quality tier
+
+```{r summary-table}
+dat %>%
+  mutate(quality_tier = case_when(
+    completeness >= 95 & contamination <= 10 ~ "High quality (≥95%, ≤10%)",
+    completeness >= 50 & contamination <= 10 ~ "Medium quality (≥50%, ≤10%)",
+    TRUE                                     ~ "Low quality / incomplete"
+  )) %>%
+  count(sampling_location, enrichment_type, quality_tier) %>%
+  pivot_wider(names_from = quality_tier, values_from = n, values_fill = 0) %>%
+  arrange(sampling_location, enrichment_type) %>%
+  rename("Sampling location" = sampling_location, "Enrichment type" = enrichment_type) %>%
+  knitr::kable(caption = "MAG counts per condition and quality tier (all binning tools combined)")
+```
