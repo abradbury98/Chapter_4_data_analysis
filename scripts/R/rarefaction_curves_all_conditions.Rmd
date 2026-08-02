@@ -1,0 +1,705 @@
+---
+title: "Rarefaction Analysis - Bacterial Diversity & Resistance Genes (All Conditions)"
+author: "Alice Bradbury"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    fig_width: 14
+    fig_height: 8
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center"
+)
+```
+
+# Overview
+
+Rarefaction analyses for **6 samples (CH01–CH06)** across **6 conditions**:
+
+| Condition | Sampling point | Enrichment | Kraken2 | Abricate |
+|-----------|---------------|------------|---------|----------|
+| ASC       | Post-ASC      | None (direct) | ✓ 6 samples | — no data |
+| ASC_CAT   | Post-ASC      | BF Bolton + CAT | ✓ 6 samples | ✓ 6 samples |
+| ASC_RVS   | Post-ASC      | BPW + RVS | ✓ 6 samples | ✓ 6 samples |
+| EVI       | Post-EVI      | None (direct) | ✓ 6 samples | ⚠ partial (CH01, CH04; card/ncbi only) |
+| EVI_CAT   | Post-EVI      | BF Bolton + CAT | ✓ 6 samples | ✓ 6 samples |
+| EVI_RVS   | Post-EVI      | BPW + RVS | ✓ 6 samples | ✓ 6 samples |
+
+Curves are interpolated (solid opaque line) and extrapolated to 2× the largest
+observed sample size within each condition (long-dashed, semi-transparent line),
+with 95% CIs (shaded ribbon, lighter in the extrapolated region), using `iNEXT`. Kraken2 matrices are subsampled to ≤ 50,000 reads per sample
+before iNEXT to keep compute time manageable.
+
+---
+
+# 1. Setup
+
+## 1.1 Libraries
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(vegan)
+library(iNEXT)
+library(ggplot2)
+library(patchwork)
+```
+
+## 1.2 Paths & Conditions
+
+All paths and filename patterns are defined here — edit this block to add/remove
+conditions or fix directory names.
+
+```{r config}
+base_reads <- "/Volumes/Alice/2_POULTRY_PROCESSING/Analysis/Reads"
+output_dir <- file.path(base_reads, "rarefaction_output")
+dir.create(output_dir, showWarnings = FALSE)
+
+# Named list: one entry per condition.
+# abricate_dir = NULL means no abricate data available for that condition.
+conditions <- list(
+  ASC = list(
+    label          = "Post-ASC: No enrichment",
+    sampling_point = "Post-ASC",
+    enrichment     = "None",
+    kraken_dir     = file.path(base_reads, "Kraken2_reads", "ASC_Kraken2_reads"),
+    kraken_pat     = "_ASC_reads_kraken2\\.report$",
+    abricate_dir   = NULL,
+    abricate_pat   = NULL
+  ),
+  ASC_CAT = list(
+    label          = "Post-ASC: Blood-free Bolton base + CAT",
+    sampling_point = "Post-ASC",
+    enrichment     = "CAT",
+    kraken_dir     = file.path(base_reads, "Kraken2_reads", "ASC_CAT_Kraken2_reads"),
+    kraken_pat     = "_ASC_CAT_reads_kraken2\\.report$",
+    abricate_dir   = file.path(base_reads, "ASC_CAT_reads_abricate"),
+    abricate_pat   = "_ASC_CAT_reads_(card|resfinder|ncbi)\\.tsv$"
+  ),
+  ASC_RVS = list(
+    label          = "Post-ASC: BPW then RVS",
+    sampling_point = "Post-ASC",
+    enrichment     = "RVS",
+    kraken_dir     = file.path(base_reads, "Kraken2_reads", "ASC_RVS"),
+    kraken_pat     = "_ASC_RVS_reads_kraken2\\.report$",
+    abricate_dir   = file.path(base_reads, "ASC_RVS_reads_abrciate"),  # NB: typo in folder name
+    abricate_pat   = "_ASC_RVS_reads_(card|resfinder|ncbi)\\.tsv$"
+  ),
+  EVI = list(
+    label          = "Post-EVI: No enrichment",
+    sampling_point = "Post-EVI",
+    enrichment     = "None",
+    kraken_dir     = file.path(base_reads, "Kraken2_reads", "EVI_Kraken2_reads"),
+    kraken_pat     = "_EVI_reads_kraken2\\.report$",
+    abricate_dir   = file.path(base_reads, "EVI_reads_abricate"),  # partial: CH01+CH04 only
+    abricate_pat   = "_EVI_reads_(card|resfinder|ncbi)\\.tsv$"
+  ),
+  EVI_CAT = list(
+    label          = "Post-EVI: Blood-free Bolton base + CAT",
+    sampling_point = "Post-EVI",
+    enrichment     = "CAT",
+    kraken_dir     = file.path(base_reads, "Kraken2_reads", "EVI_CAT_Kraken2_reads"),
+    kraken_pat     = "_EVI_CAT_reads_kraken2\\.report$",
+    abricate_dir   = file.path(base_reads, "EVI_CAT_reads_abricate"),
+    abricate_pat   = "_EVI_CAT_reads_(card|resfinder|ncbi)\\.tsv$"
+  ),
+  EVI_RVS = list(
+    label          = "Post-EVI: BPW then RVS",
+    sampling_point = "Post-EVI",
+    enrichment     = "RVS",
+    kraken_dir     = file.path(base_reads, "Kraken2_reads", "EVI_RVS"),
+    kraken_pat     = "_EVI_RVS_reads_kraken2\\.report$",
+    abricate_dir   = file.path(base_reads, "EVI_RVS_reads_abricate"),
+    abricate_pat   = "_EVI_RVS_reads_(card|resfinder|ncbi)\\.tsv$"
+  )
+)
+
+# Ordered factor levels so facets appear in the right order (ASC row, then EVI row)
+condition_label_order <- map_chr(conditions, "label")
+```
+
+## 1.3 Colour Palettes
+
+```{r colours}
+# One colour per sample — used consistently across all plots
+sample_colours <- c(
+  CH01 = "#E63946",
+  CH02 = "#F4A261",
+  CH03 = "#2A9D8F",
+  CH04 = "#457B9D",
+  CH05 = "#8338EC",
+  CH06 = "#FB5607"
+)
+
+# Blues for post-ASC, oranges for post-EVI (dark = enriched)
+condition_colours <- c(
+  ASC     = "#A6CEE3",
+  ASC_CAT = "#1F78B4",
+  ASC_RVS = "#08519C",
+  EVI     = "#FDBE85",
+  EVI_CAT = "#E6550D",
+  EVI_RVS = "#7F2704"
+)
+```
+
+---
+
+# 2. Kraken2 - Bacterial Diversity
+
+## 2.1 Load, Subsample & Run iNEXT
+
+Genus-level (`rank == "G"`) rows are extracted from each `.report` file using
+`reads_covered` (total reads in the genus clade, including all species beneath it).
+`reads_direct` is not used as it only counts reads assigned to the genus node itself
+and is near zero for most genera — species-classified reads dominate.
+Each condition's matrix is subsampled to ≤ 50,000 reads (or the condition minimum,
+whichever is lower) before iNEXT — raw metagenomic depths are too large for iNEXT
+to handle efficiently. iNEXT is then run per condition; results are combined into a
+single tidy data frame for plotting.
+
+```{r kraken-load, cache=TRUE}
+read_kraken_report <- function(filepath, sample_name) {
+  df <- read.table(filepath, sep = "\t", header = FALSE,
+                   col.names = c("pct", "reads_covered", "reads_direct",
+                                 "rank", "taxid", "name"),
+                   fill = TRUE, quote = "")
+  df %>%
+    filter(rank == "G", reads_covered > 0) %>%
+    mutate(name = trimws(name), sample = sample_name) %>%
+    select(sample, name, reads_covered)
+}
+
+build_kraken_matrix <- function(cfg) {
+  files <- list.files(cfg$kraken_dir, pattern = "\\.report$", full.names = TRUE)
+  stopifnot("No .report files found" = length(files) > 0)
+
+  samples <- sub(cfg$kraken_pat, "", basename(files))
+  long    <- bind_rows(mapply(read_kraken_report, files, samples, SIMPLIFY = FALSE))
+
+  mat <- long %>%
+    pivot_wider(names_from = name, values_from = reads_covered, values_fill = 0L) %>%
+    as.data.frame()
+  rownames(mat) <- mat$sample
+  mat$sample    <- NULL
+  round(mat)
+}
+
+kraken_inext_df <- map_dfr(names(conditions), function(cond) {
+  cfg <- conditions[[cond]]
+  message("Kraken2 — ", cfg$label)
+
+  mat <- build_kraken_matrix(cfg)
+  mat <- mat[rowSums(mat) > 0, , drop = FALSE]
+
+  min_depth       <- min(rowSums(mat))
+  subsample_depth <- min(min_depth, 50000L)
+  message("  subsampling to ", subsample_depth, " reads (min = ", min_depth, ")")
+
+  set.seed(42)
+  sub <- rrarefy(mat, sample = subsample_depth)
+  sub <- sub[, colSums(sub) > 0, drop = FALSE]
+
+  inext_list <- lapply(rownames(sub), function(s) as.numeric(sub[s, sub[s, ] > 0]))
+  names(inext_list) <- rownames(sub)
+
+  out <- iNEXT(inext_list, q = 0, datatype = "abundance",
+               endpoint = 2L * subsample_depth, nboot = 20)
+  saveRDS(out, file.path(output_dir, paste0("inext_kraken_", cond, ".rds")))
+
+  out$iNextEst$size_based %>%
+    mutate(
+      condition       = cond,
+      condition_label = factor(cfg$label, levels = condition_label_order),
+      sample          = Assemblage
+    )
+})
+```
+
+## 2.2 Summary Table
+
+```{r kraken-summary}
+kraken_inext_df %>%
+  filter(grepl("observed", Method, ignore.case = TRUE)) %>%
+  select(condition_label, sample, m, qD) %>%
+  rename(Condition = condition_label, Sample = sample,
+         Reads_subsampled = m, Genera_observed = qD) %>%
+  arrange(Condition, Sample)
+```
+
+## 2.3 Rarefaction Curves — All Conditions
+
+```{r kraken-plot, fig.width=16, fig.height=10, fig.cap="Bacterial genus richness. Solid opaque = interpolated; long-dashed transparent = extrapolated (2x subsampled depth); ribbon = 95% CI. Top row: post-ASC; bottom row: post-EVI."}
+p_kraken <- ggplot(kraken_inext_df,
+                   aes(x = m, y = qD, colour = sample, fill = sample,
+                       group = sample)) +
+  geom_ribbon(data = \(d) filter(d, Method %in% c("Interpolated", "Rarefaction")),
+              aes(ymin = qD.LCL, ymax = qD.UCL), alpha = 0.18, colour = NA) +
+  geom_ribbon(data = \(d) filter(d, Method %in% c("Extrapolated", "Extrapolation")),
+              aes(ymin = qD.LCL, ymax = qD.UCL), alpha = 0.07, colour = NA) +
+  geom_line(data = \(d) filter(d, Method %in% c("Interpolated", "Rarefaction")),
+            linewidth = 0.9) +
+  geom_line(data = \(d) filter(d, Method %in% c("Extrapolated", "Extrapolation")),
+            linewidth = 0.8, linetype = "longdash", alpha = 0.45) +
+  geom_point(data = \(d) filter(d, Method == "Observed" | grepl("observed", Method, ignore.case = TRUE)),
+             size = 2.5, shape = 21, colour = "white", stroke = 0.6) +
+  facet_wrap(~ condition_label, scales = "free_x", ncol = 3) +
+  scale_colour_manual(values = sample_colours) +
+  scale_fill_manual(values = sample_colours) +
+  labs(
+    title  = "Bacterial Genus Diversity (Kraken2, genus level)",
+    x      = "Reads subsampled",
+    y      = "Genus richness",
+    colour = "Sample",
+    fill   = "Sample"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right"
+  )
+
+p_kraken
+
+ggsave(file.path(output_dir, "kraken2_diversity_all_conditions.png"),
+       p_kraken, width = 16, height = 10, dpi = 600)
+message("Saved: kraken2_diversity_all_conditions.png")
+```
+
+---
+
+# 3. Abricate — Resistance Genes & Classes
+
+> **Note:** The post-ASC no-enrichment condition has no Abricate data.
+> The post-EVI no-enrichment condition has partial data (CH01 and CH04 only;
+> CARD and NCBI databases only). These samples are included where data exists
+> but the curves should be interpreted cautiously.
+
+## 3.1 Load All Conditions
+
+Each `.tsv` may contain repeated `#FILE` header lines (Abricate concatenation
+artefact); these are stripped before parsing.
+
+```{r abricate-load}
+read_abricate_file <- function(filepath, sample_name) {
+  lines <- readLines(filepath, warn = FALSE)
+  header_idx <- grep("^#FILE", lines)
+  if (length(header_idx) == 0) return(NULL)
+
+  clean <- c(lines[header_idx[1]], lines[!grepl("^#FILE", lines)])
+  df <- tryCatch(
+    read.table(text = paste(clean, collapse = "\n"),
+               sep = "\t", header = TRUE, quote = "",
+               comment.char = "", fill = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  colnames(df)[1] <- "FILE"
+  df %>%
+    filter(!is.na(GENE), GENE != "") %>%
+    mutate(sample = sample_name) %>%
+    select(sample, GENE, RESISTANCE, DATABASE)
+}
+
+abricate_long <- map_dfr(names(conditions), function(cond) {
+  cfg <- conditions[[cond]]
+  if (is.null(cfg$abricate_dir)) return(NULL)
+
+  files <- list.files(cfg$abricate_dir, pattern = "\\.tsv$", full.names = TRUE)
+  if (length(files) == 0) { message("No .tsv files for: ", cond); return(NULL) }
+  message("Abricate — ", cfg$label, " (", length(files), " files)")
+
+  map_dfr(files, function(f) {
+    sname <- sub(cfg$abricate_pat, "", basename(f))
+    df    <- read_abricate_file(f, sname)
+    if (!is.null(df))
+      mutate(df, condition = cond, condition_label = cfg$label)
+  })
+})
+```
+
+## 3.2 Summary
+
+```{r abricate-summary}
+abricate_long %>%
+  count(condition_label, sample, DATABASE) %>%
+  pivot_wider(names_from = DATABASE, values_from = n, values_fill = 0L) %>%
+  rename(Condition = condition_label, Sample = sample) %>%
+  arrange(Condition, Sample)
+```
+
+## 3.3 Shared Helpers
+
+```{r helpers}
+make_matrix <- function(df, feature_col) {
+  df %>%
+    count(sample, .data[[feature_col]]) %>%
+    pivot_wider(names_from = all_of(feature_col), values_from = n,
+                values_fill = 0L) %>%
+    as.data.frame() %>%
+    { rownames(.) <- .$sample; .$sample <- NULL; . }
+}
+
+run_inext <- function(mat, cond, cfg) {
+  mat <- mat[rowSums(mat) > 0, , drop = FALSE]
+  if (nrow(mat) == 0) return(NULL)
+
+  inext_list <- lapply(rownames(mat), function(s) as.numeric(mat[s, mat[s, ] > 0]))
+  names(inext_list) <- rownames(mat)
+
+  out <- iNEXT(inext_list, q = 0, datatype = "abundance",
+               endpoint = 2L * max(rowSums(mat)), nboot = 20)
+
+  out$iNextEst$size_based %>%
+    mutate(
+      condition       = cond,
+      condition_label = factor(cfg$label, levels = condition_label_order),
+      sample          = Assemblage
+    )
+}
+
+# Conditions that have abricate data (in label order for facets)
+abricate_conds <- names(conditions)[
+  !map_lgl(conditions, ~ is.null(.x$abricate_dir)) &
+  map_chr(conditions, "enrichment") != "None"
+]
+abricate_label_order <- map_chr(conditions[abricate_conds], "label")
+
+plot_rarefaction <- function(df, title, xlab, ylab) {
+  df <- df %>%
+    mutate(condition_label = factor(condition_label, levels = abricate_label_order))
+
+  ggplot(df, aes(x = m, y = qD, colour = sample, fill = sample, group = sample)) +
+    geom_ribbon(data = \(d) filter(d, Method %in% c("Interpolated", "Rarefaction")),
+                aes(ymin = qD.LCL, ymax = qD.UCL), alpha = 0.18, colour = NA) +
+    geom_ribbon(data = \(d) filter(d, Method %in% c("Extrapolated", "Extrapolation")),
+                aes(ymin = qD.LCL, ymax = qD.UCL), alpha = 0.07, colour = NA) +
+    geom_line(data = \(d) filter(d, Method %in% c("Interpolated", "Rarefaction")),
+              linewidth = 0.9) +
+    geom_line(data = \(d) filter(d, Method %in% c("Extrapolated", "Extrapolation")),
+              linewidth = 0.8, linetype = "longdash", alpha = 0.45) +
+    geom_point(data = \(d) filter(d, Method == "Observed" | grepl("observed", Method, ignore.case = TRUE)),
+               size = 2.5, shape = 21, colour = "white", stroke = 0.6) +
+    facet_wrap(~ condition_label, scales = "free_x", ncol = 3) +
+    scale_colour_manual(values = sample_colours) +
+    scale_fill_manual(values = sample_colours) +
+    labs(title = title, x = xlab, y = ylab, colour = "Sample", fill = "Sample") +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 13),
+      panel.grid.minor = element_blank(),
+      legend.position  = "right"
+    )
+}
+```
+
+---
+
+## 3.4 Resistance Gene Richness — All Databases Combined
+
+```{r genes-all, fig.width=16, fig.height=10, fig.cap="Resistance gene richness (CARD + ResFinder + NCBI combined). Top row: post-ASC; bottom row: post-EVI. EVI no-enrichment shown with partial data only."}
+gene_df_all <- map_dfr(abricate_conds, function(cond) {
+  sub_df <- filter(abricate_long, condition == cond)
+  if (nrow(sub_df) == 0) return(NULL)
+  run_inext(make_matrix(sub_df, "GENE"), cond, conditions[[cond]])
+})
+
+p_genes_all <- plot_rarefaction(
+  gene_df_all,
+  title = "Resistance Gene Richness - All Databases (CARD + ResFinder + NCBI)",
+  xlab  = "Hits sampled",
+  ylab  = "Unique resistance genes"
+)
+p_genes_all
+
+ggsave(file.path(output_dir, "resistance_genes_all_databases_all_conditions.png"),
+       p_genes_all, width = 16, height = 10, dpi = 300)
+message("Saved: resistance_genes_all_databases_all_conditions.png")
+```
+
+---
+
+## 3.5 Resistance Class Richness — All Databases Combined
+
+```{r classes-all, fig.width=16, fig.height=10, fig.cap="Resistance class richness across all conditions."}
+class_df_all <- map_dfr(abricate_conds, function(cond) {
+  sub_df <- filter(abricate_long, condition == cond,
+                   !is.na(RESISTANCE), RESISTANCE != "")
+  if (nrow(sub_df) == 0) return(NULL)
+  run_inext(make_matrix(sub_df, "RESISTANCE"), cond, conditions[[cond]])
+})
+
+p_classes_all <- plot_rarefaction(
+  class_df_all,
+  title = "Resistance Class Richness - All Databases",
+  xlab  = "Hits sampled",
+  ylab  = "Unique resistance classes"
+)
+p_classes_all
+
+ggsave(file.path(output_dir, "resistance_classes_all_databases_all_conditions.png"),
+       p_classes_all, width = 16, height = 10, dpi = 300)
+message("Saved: resistance_classes_all_databases_all_conditions.png")
+```
+
+---
+
+## 3.6 Per-Database Breakdown
+
+### Resistance Gene Richness
+
+```{r genes-per-db, fig.width=16, fig.height=10}
+databases <- sort(unique(abricate_long$DATABASE))
+
+for (db in databases) {
+  df_db <- map_dfr(abricate_conds, function(cond) {
+    sub_df <- filter(abricate_long, condition == cond, DATABASE == db)
+    if (nrow(sub_df) == 0) return(NULL)
+    run_inext(make_matrix(sub_df, "GENE"), cond, conditions[[cond]])
+  })
+  if (is.null(df_db) || nrow(df_db) == 0) next
+
+  p <- plot_rarefaction(df_db,
+    title = paste0("Resistance Gene Richness - ", toupper(db)),
+    xlab  = "Hits sampled", ylab = "Unique resistance genes")
+  print(p)
+  fname <- paste0("resistance_genes_", tolower(db), "_all_conditions.png")
+  ggsave(file.path(output_dir, fname), p, width = 16, height = 10, dpi = 300)
+  message("Saved: ", fname)
+}
+```
+
+### Resistance Class Richness
+
+```{r classes-per-db, fig.width=16, fig.height=10}
+for (db in databases) {
+  df_db <- map_dfr(abricate_conds, function(cond) {
+    sub_df <- filter(abricate_long, condition == cond, DATABASE == db,
+                     !is.na(RESISTANCE), RESISTANCE != "")
+    if (nrow(sub_df) == 0) return(NULL)
+    run_inext(make_matrix(sub_df, "RESISTANCE"), cond, conditions[[cond]])
+  })
+  if (is.null(df_db) || nrow(df_db) == 0) next
+
+  p <- plot_rarefaction(df_db,
+    title = paste0("Resistance Class Richness - ", toupper(db)),
+    xlab  = "Hits sampled", ylab = "Unique resistance classes")
+  print(p)
+  fname <- paste0("resistance_classes_", tolower(db), "_all_conditions.png")
+  ggsave(file.path(output_dir, fname), p, width = 16, height = 10, dpi = 300)
+  message("Saved: ", fname)
+}
+```
+
+---
+
+# 4. MEGARes — Resistance Genes & Drug Classes
+
+MEGARes data comes from ABRicate screening against the MEGARes v3 database.
+`all_samples_BPKG_long.tsv` holds one row per gene per sample with two distinct
+count columns:
+
+- **`n_reads`** — raw integer count of reads mapping to that gene (one row per
+  read in the original ABRicate TSV). This is confirmed: 28 raw ABRicate
+  alignments for CAT in barcode01 ASC_BFBB = `n_reads = 28` in this file.
+- **`BPKG`** — the normalised value (reads per kilobase per genome equivalent).
+  **This is NOT used here.** iNEXT requires integer abundance counts.
+
+Only enriched conditions are present (BF Bolton + CAT and BPW + RVS, at both
+sampling points); no-enrichment samples were not screened against MEGARes.
+
+The MEGARes sample naming uses `BFBB` (BF Bolton Broth Base) for the CAT-enriched
+condition. Conditions are mapped to the same labels used in sections 2 and 3 above.
+Drug class is parsed from the hierarchical `product` annotation
+(`Type:Class:Mechanism:Gene` — e.g. `Drugs:Phenicol:...:CAT`).
+
+## 4.1 Load & Parse
+
+```{r megares-load}
+megares_raw <- read.delim(
+  file.path(base_reads, "all_samples_BPKG_long.tsv"),
+  sep = "\t", header = TRUE, quote = "", stringsAsFactors = FALSE
+) %>%
+  filter(database == "megares", n_reads > 0)
+# n_reads = raw read count; BPKG column (normalised) is intentionally not used
+
+# Map BFBB → CAT to match the condition keys used throughout this document
+megares_cond_map <- c(
+  ASC_BFBB = "ASC_CAT",
+  ASC_RVS  = "ASC_RVS",
+  EVI_BFBB = "EVI_CAT",
+  EVI_RVS  = "EVI_RVS"
+)
+
+megares_long <- megares_raw %>%
+  mutate(
+    sample_id    = sub("_(ASC|EVI)_(BFBB|RVS)$", "", sample),
+    cond_raw     = sub("^CH\\d+_", "", sample),
+    condition    = megares_cond_map[cond_raw],
+    drug_class   = sapply(strsplit(product, ":"), function(x)
+                     if (length(x) >= 2) x[2] else x[1])
+  ) %>%
+  filter(!is.na(condition)) %>%
+  select(sample = sample_id, condition, GENE, drug_class, n_reads)
+
+megares_conds <- sort(unique(megares_long$condition)) %>%
+  .[map_chr(conditions[.], "enrichment") != "None"]
+megares_label_order <- map_chr(conditions[megares_conds], "label")
+```
+
+## 4.2 Summary
+
+```{r megares-summary}
+megares_long %>%
+  group_by(condition, sample) %>%
+  summarise(total_reads = sum(n_reads), unique_genes = n_distinct(GENE),
+            .groups = "drop") %>%
+  mutate(condition_label = map_chr(condition, ~ conditions[[.x]]$label)) %>%
+  select(Condition = condition_label, Sample = sample,
+         Total_reads = total_reads, Unique_genes = unique_genes) %>%
+  arrange(Condition, Sample)
+```
+
+## 4.3 Shared iNEXT Helper (MEGARes)
+
+iNEXT treats `n_reads` as abundance counts — the x-axis reflects reads subsampled
+from the MEGARes-mapped read pool, and the y-axis is unique genes detected.
+
+```{r megares-helper}
+run_inext_megares <- function(mat, cond) {
+  mat <- mat[rowSums(mat) > 0, , drop = FALSE]
+  if (nrow(mat) == 0) return(NULL)
+
+  inext_list <- lapply(rownames(mat), function(s) as.numeric(mat[s, mat[s, ] > 0]))
+  names(inext_list) <- rownames(mat)
+
+  out <- iNEXT(inext_list, q = 0, datatype = "abundance",
+               endpoint = 2L * max(rowSums(mat)), nboot = 20)
+
+  out$iNextEst$size_based %>%
+    mutate(
+      condition       = cond,
+      condition_label = factor(conditions[[cond]]$label,
+                               levels = megares_label_order),
+      sample          = Assemblage
+    )
+}
+
+plot_rarefaction_megares <- function(df, title, xlab, ylab) {
+  ggplot(df, aes(x = m, y = qD, colour = sample, fill = sample, group = sample)) +
+    geom_ribbon(data = \(d) filter(d, Method %in% c("Interpolated", "Rarefaction")),
+                aes(ymin = qD.LCL, ymax = qD.UCL), alpha = 0.18, colour = NA) +
+    geom_ribbon(data = \(d) filter(d, Method %in% c("Extrapolated", "Extrapolation")),
+                aes(ymin = qD.LCL, ymax = qD.UCL), alpha = 0.07, colour = NA) +
+    geom_line(data = \(d) filter(d, Method %in% c("Interpolated", "Rarefaction")),
+              linewidth = 0.9) +
+    geom_line(data = \(d) filter(d, Method %in% c("Extrapolated", "Extrapolation")),
+              linewidth = 0.8, linetype = "longdash", alpha = 0.45) +
+    geom_point(data = \(d) filter(d, Method == "Observed" | grepl("observed", Method, ignore.case = TRUE)),
+               size = 2.5, shape = 21, colour = "white", stroke = 0.6) +
+    facet_wrap(~ condition_label, scales = "free_x", ncol = 2) +
+    scale_colour_manual(values = sample_colours) +
+    scale_fill_manual(values = sample_colours) +
+    labs(title = title, x = xlab, y = ylab, colour = "Sample", fill = "Sample") +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 13),
+      panel.grid.minor = element_blank(),
+      legend.position  = "right"
+    )
+}
+```
+
+## 4.4 Resistance Gene Richness
+
+```{r megares-genes, fig.width=14, fig.height=9, fig.cap="MEGARes resistance gene richness. Enriched conditions only (no-enrichment samples not available). 2x2 grid: top row post-ASC, bottom row post-EVI."}
+megares_gene_df <- map_dfr(megares_conds, function(cond) {
+  mat <- megares_long %>%
+    filter(condition == cond) %>%
+    select(sample, GENE, n_reads) %>%
+    pivot_wider(names_from = GENE, values_from = n_reads,
+                values_fn = sum, values_fill = 0L) %>%
+    as.data.frame() %>%
+    { rownames(.) <- .$sample; .$sample <- NULL; . }
+  run_inext_megares(mat, cond)
+})
+
+p_megares_genes <- plot_rarefaction_megares(
+  megares_gene_df,
+  title = "Resistance Gene Richness - MEGARes",
+  xlab  = "Reads subsampled (MEGARes-mapped)",
+  ylab  = "Unique resistance genes"
+)
+p_megares_genes
+
+ggsave(file.path(output_dir, "megares_resistance_genes_all_conditions.png"),
+       p_megares_genes, width = 14, height = 9, dpi = 600)
+message("Saved: megares_resistance_genes_all_conditions.png")
+```
+
+## 4.5 Drug Class Richness
+
+```{r megares-classes, fig.width=14, fig.height=9, fig.cap="MEGARes drug class richness (second level of MEGARes hierarchy)."}
+megares_class_df <- map_dfr(megares_conds, function(cond) {
+  mat <- megares_long %>%
+    filter(condition == cond) %>%
+    select(sample, drug_class, n_reads) %>%
+    pivot_wider(names_from = drug_class, values_from = n_reads,
+                values_fn = sum, values_fill = 0L) %>%
+    as.data.frame() %>%
+    { rownames(.) <- .$sample; .$sample <- NULL; . }
+  run_inext_megares(mat, cond)
+})
+
+p_megares_classes <- plot_rarefaction_megares(
+  megares_class_df,
+  title = "Drug Class Richness - MEGARes",
+  xlab  = "Reads subsampled (MEGARes-mapped)",
+  ylab  = "Unique drug classes"
+)
+p_megares_classes
+
+ggsave(file.path(output_dir, "megares_drug_classes_all_conditions.png"),
+       p_megares_classes, width = 14, height = 9, dpi = 600)
+message("Saved: megares_drug_classes_all_conditions.png")
+```
+
+---
+
+# 5. Combined Summary Panel
+
+```{r combined-panel, fig.width=16, fig.height=20, fig.cap="Top: bacterial diversity (all 6 conditions). Middle: Abricate resistance gene richness. Bottom: MEGARes resistance gene richness."}
+p_combined <- p_kraken / p_megares_genes / p_megares_classes +
+  plot_annotation(
+    title = "Rarefaction Analysis",
+    theme = theme(plot.title = element_text(face = "bold", size = 15, hjust = 0.5))
+  )
+
+p_combined
+
+ggsave(file.path(output_dir, "combined_rarefaction_all_conditions.png"),
+       p_combined, width = 16, height = 20, dpi = 600)
+message("Saved: combined_rarefaction_all_conditions.png")
+```
+
+---
+
+# 6. Session Info
+
+```{r session-info}
+sessionInfo()
+```
