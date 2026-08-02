@@ -1,6 +1,6 @@
 # Chapter 5 Data Analysis
 
-> Analysis scripts for Chapter 5 of the thesis — retail poultry metagenomics (New Zealand and China).  
+> Analysis scripts for Chapter 4 - Poultry processing plant.  
 > Workflows cover taxonomic classification, AMR profiling, host depletion benchmarking, MAG assembly and refinement, and phylogenetic reconstruction.
 
 ---
